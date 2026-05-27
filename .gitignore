@@ -1,0 +1,17 @@
+# ESP-IDF / Arduino ESP32
+build/
+downloads/
+sdkconfig
+sdkconfig.old
+*.elf
+*.bin
+*.exe
+*.map
+*.o
+*.a
+*.so
+*.d
+.pio/
+.ipynb_checkpoints/
+.vscode/
+*.log
