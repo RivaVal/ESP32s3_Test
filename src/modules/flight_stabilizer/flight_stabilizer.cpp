@@ -5,7 +5,8 @@
  * @brief Реализация ПИД-стабилизации с адаптивными параметрами
  * @version 2.0.0 (ESP32-S3 адаптация)
  */
-#include "modules/flight_stabilizer/flight_stabilizer.h"
+#include "modules/flight_stabilizer/FlightStabilizer.h"
+// #include "modules/flight_stabilizer/FlightStabilizer.h"
 #include <math.h>
 
 // Тег для логирования
@@ -326,5 +327,132 @@ void FlightStabilizer::updateAdaptiveParams(float vibrationLevel) {
     #endif
 }
 
+//   ===*********************************************************
 // 🔧 Остальные методы (validateAngles, printStatus, isStable, resetPIDStates, modeToString)
 // реализуются аналогично исходному коду с добавлением ESP_LOG
+
+
+/**
+* @brief Валидация углов от IMU
+*
+* @param roll Крен (градусы) - передаётся по ссылке
+* @param pitch Тангаж (градусы) - передаётся по ссылке
+* @param yaw Рыскание (градусы) - передаётся по ссылке
+*
+* @note Защита от аномальных значений датчика
+*/
+void FlightStabilizer::validateAngles(float& roll, float& pitch, float& yaw) {
+    // Проверка крена
+    if (isnan(roll) || isinf(roll) || abs(roll) > 120.0f) {
+        roll = 0.0f;
+        ESP_LOGW(TAG_FLIGHT, "⚠️ Аномальный крен: сброшено в 0°");
+    }
+
+    // Проверка тангажа
+    if (isnan(pitch) || isinf(pitch) || abs(pitch) > 120.0f) {
+        pitch = 0.0f;
+        ESP_LOGW(TAG_FLIGHT, "⚠️ Аномальный тангаж: сброшено в 0°");
+    }
+
+    // Проверка рыскания
+    if (isnan(yaw) || isinf(yaw) || yaw < 0.0f || yaw > 360.0f) {
+        yaw = 0.0f;
+        ESP_LOGW(TAG_FLIGHT, "⚠️ Аномальное рыскание: сброшено в 0°");
+    }
+}
+
+// ============================================================================
+// ДИАГНОСТИКА
+// ============================================================================
+
+/**
+* @brief Вывод статуса системы в лог
+*/
+void FlightStabilizer::printStatus() const {
+    ESP_LOGI(TAG_FLIGHT, "=== СТАТУС СИСТЕМЫ СТАБИЛИЗАЦИИ ===");
+    ESP_LOGI(TAG_FLIGHT, "Режим: %s", modeToString(_mode));
+    ESP_LOGI(TAG_FLIGHT, "Состояние: %s", _enabled ? "ВКЛЮЧЕНА" : "ВЫКЛЮЧЕНА");
+    ESP_LOGI(TAG_FLIGHT, "Инициализирована: %s", _initialized ? "ДА" : "НЕТ");
+
+    if (imuHandler && !imuHandler->isDataValid()) {
+        ESP_LOGW(TAG_FLIGHT, "⚠️ Данные гироскопа недоступны");
+    }
+
+    ESP_LOGI(TAG_FLIGHT, "Статистика:");
+    ESP_LOGI(TAG_FLIGHT, "  Обновлений: %lu", _stats.stabilizations);
+    ESP_LOGI(TAG_FLIGHT, "  Коррекций: %lu", _stats.corrections);
+    ESP_LOGI(TAG_FLIGHT, "  Насыщений: %lu", _stats.saturationEvents);
+    ESP_LOGI(TAG_FLIGHT, "  Ошибок данных: %lu", _stats.invalidDataEvents);
+    ESP_LOGI(TAG_FLIGHT, "===================================");
+}
+
+/**
+* @brief Преобразование режима стабилизации в строку
+* @param mode Режим для преобразования
+* @return Строковое описание режима
+*/
+const char* FlightStabilizer::modeToString(StabilizationMode mode) const {
+    switch (mode) {
+        case StabilizationMode::MANUAL:      return "MANUAL (ручной)";
+        case StabilizationMode::ROLL_PITCH:  return "ROLL_PITCH (автогоризонт)";
+        case StabilizationMode::FULL:        return "FULL (полная)";
+        case StabilizationMode::HOVER:       return "HOVER (удержание)";
+        default:                             return "UNKNOWN";
+    }
+}
+
+/**
+* @brief Проверка стабильности положения
+* @return true если положение стабильно
+*
+* @note Стабильным считается положение с малыми углами и угловыми скоростями
+*/
+bool FlightStabilizer::isStable() const {
+    if (!imuHandler || !imuHandler->isDataValid()) {
+        return false;
+    }
+
+    const SensorData& data = imuHandler->getData();
+
+    // Проверка углов и угловых скоростей
+    bool anglesStable = (abs(data.roll) < 5.0f && abs(data.pitch) < 5.0f);
+    bool ratesStable = (abs(data.gyro.x) < 0.17f && abs(data.gyro.y) < 0.17f); // ~10°/с в рад/с
+
+    return anglesStable && ratesStable;
+}
+
+
+// Реализация адаптивности
+void FlightStabilizer::updateAdaptiveParams(float vibrationLevel) {
+    if (!_adaptivePIDEnabled) {
+        // Если адаптивность выключена — возвращаем базовые
+        _rollPID = _baseRollPID;
+        _pitchPID = _basePitchPID;
+        return;
+    }
+
+    // Нормализуем вибрацию [0.0 ... 1.0]
+    float vib = constrain(vibrationLevel, 0.0f, 1.0f);
+
+    // 📐 АЛГОРИТМ:
+    // Чем выше вибрация, тем МЕНЬШЕ Kp (чтобы сервы не дергались от шума)
+    // и МЕНЬШЕ Kd (производная усиливает высокочастотный шум).
+    // Ki оставляем почти без изменений для удержания позиции.
+
+    // Формула: New = Base * (1.0 - vib * dampingFactor)
+    // dampingFactor = 0.7 (при макс вибрации оставляем 30% мощности)
+
+    float factor = 1.0f - (vib * 0.7f);
+
+    _rollPID.kp = _baseRollPID.kp * factor;
+    _rollPID.kd = _baseRollPID.kd * factor * 0.5f; // Kd снижаем агрессивнее
+
+    _pitchPID.kp = _basePitchPID.kp * factor;
+    _pitchPID.kd = _basePitchPID.kd * factor * 0.5f;
+
+    // Ki (интегратор) снижаем незначительно, чтобы не потерять ориентацию
+    _rollPID.ki = _baseRollPID.ki * (1.0f - vib * 0.3f);
+    _pitchPID.ki = _basePitchPID.ki * (1.0f - vib * 0.3f);
+}
+
+// #endif // FLIGHT_STABILIZER_H

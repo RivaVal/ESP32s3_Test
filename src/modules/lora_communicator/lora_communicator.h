@@ -12,8 +12,8 @@
 #include <Arduino.h>
 #include <esp_log.h>
 #include <RadioLib.h>
-#include "../../config/pins.h"
-#include "../../common/types.h"
+#include "config/pins.h"
+#include "common/types.h"
 
 #define LORA_TAG "LORA_RX"
 

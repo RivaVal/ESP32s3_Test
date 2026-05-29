@@ -13,9 +13,14 @@
 #define FILTER_MANAGER_H
 
 #include "common/types.h"
-#include "modules/filter/mahony_filter.h"
-#include "modules/filter/madgwick_filter.h"
-#include "modules/vibration/vibration_estimator.h"
+
+#include "modules/filter_manager/MahonyFilter.h"
+#include "modules/filter_manager/MadgwickFilter.h"
+#include "modules/vibration/VibrationEstimator.h"
+
+// #include "modules/filter/mahony_filter.h"
+// #include "modules/filter/madgwick_filter.h"
+// #include "modules/vibration/vibration_estimator.h"
 
 enum class FilterType { MAHONY, MADGWICK };
 

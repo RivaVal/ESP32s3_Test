@@ -6,7 +6,10 @@
  * - Добавлена потокобезопасность (мьютекс) для ISR и loop()
  * - Вся отладка переведена на ESP_LOG
  */
-#include "lora_communicator.h"
+#include "modules/lora_communicator/lora_communicator.h"
+// #include "lora_communicator.h"
+#include "config/pins.h"
+#include "common/CommonTypes.h"
 
 // Таблица CRC8 (полином 0x07)
 static const uint8_t CRC8_TABLE[256] = {
@@ -61,10 +64,10 @@ bool LoRaReceiver::begin() {
     }
 
     // Инициализация радио (RadioLib 7.6.0 API)
-    int state = _radio->begin(Config::Pins::FREQUENCY, Config::Pins::BANDWIDTH,
-                              Config::Pins::SPREADING, Config::Pins::CODING_RATE,
-                              Config::Pins::SYNC_WORD, Config::Pins::TX_POWER,
-                              Config::Pins::PREAMBLE_LEN);
+    int state = _radio->begin(Config::Radio::FREQUENCY, Config::Radio::BANDWIDTH,
+                              Config::Radio::SPREADING_FACTOR, Config::Radio::CODING_RATE,
+                              Config::Radio::SYNC_WORD, Config::Radio::OUTPUT_POWER,
+                              Config::Radio::PREAMBLE_LEN);
     if (state != RADIOLIB_ERR_NONE) {
         ESP_LOGE(LORA_TAG, "❌ begin() failed: %d", state);
         return false;
@@ -84,7 +87,7 @@ bool LoRaReceiver::begin() {
 
     _initialized = true;
     _state = LoRaState::LISTENING;
-    ESP_LOGI(LORA_TAG, "✅ Receiver READY | Freq:%.1f MHz SF%d", Config::Pins::FREQUENCY, Config::Pins::SPREADING);
+    ESP_LOGI(LORA_TAG, "✅ Receiver READY | Freq:%.1f MHz SF%d", Config::Radio::FREQUENCY, Config::Radio::SPREADING_FACTOR);
     return true;
 }
 

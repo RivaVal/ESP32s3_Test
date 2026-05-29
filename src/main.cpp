@@ -33,6 +33,9 @@
 #include "modules/i2c_master/i2c_master.h"
 #include "modules/pca9685_servo/pca9685_servo.h"
 
+#include "modules/unified_ledc/unified_ledc.h"      // 🆕 ШАГ 5: LEDC
+// Пока ждем #include "modules/battery_monitor/battery_monitor.h"  // 🆕 ШАГ 6
+
 #include "config/pins.h"
 #include "common/types.h"
 

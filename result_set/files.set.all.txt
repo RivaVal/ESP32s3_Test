@@ -1,0 +1,4749 @@
+
+=== Файл: ./main.cpp ===
+
+/**
+ * @file main.cpp
+ * @brief Точка входа проекта UAV_ESP32S3_Core (ШАГ 1: LoRa модуль)
+ * @details 
+ * - Инициализация USB CDC, PSRAM, LoRa
+ * - Демонстрация приёма пакетов и отправки ACK
+ * - Готово для последовательного добавления других модулей
+ */
+/**
+ * @file main.cpp
+ * @brief Точка входа для проекта UAV_ESP32S3_Core (ШАГ 4: Интеграция PCA9685)
+ * @details
+ * - Инициализация: USB CDC, PSRAM, LoRa, I2C, PCA9685
+ * - Предстартовый тест сервоприводов
+ * - Основной цикл с обработкой команд и отправкой телеметрии
+ *
+ * @environment ESP32-S3-N16R8 | PlatformIO | Arduino Framework
+ * @version 1.1 (ШАГ 4: Интеграция PCA9685)
+ * @date 2026-05-26
+ */
+
+#include <Arduino.h>
+#include <esp_log.h>
+
+// ============================================================================
+// Подключения модулей
+// ============================================================================
+// ✅ ШАГ 2: Модуль связи (уже работает)
+#include "modules/lora_communicator/lora_communicator.h"
+
+// 🆕 ШАГ 4: Новые модули
+#include "modules/i2c_master/i2c_master.h"
+#include "modules/pca9685_servo/pca9685_servo.h"
+
+#include "modules/unified_ledc/unified_ledc.h"      // 🆕 ШАГ 5: LEDC
+// Пока ждем #include "modules/battery_monitor/battery_monitor.h"  // 🆕 ШАГ 6
+
+#include "config/pins.h"
+#include "common/types.h"
+
+// ============================================================================
+// Конфигурация отладки
+// ============================================================================
+static const char* TAG = "MAIN";
+
+// ============================================================================
+// Глобальные объекты модулей
+// ============================================================================
+static I2CMasterController i2c_manager;                    ///< Контроллер I2C
+static PCA9685ServoController servo_controller;            ///< Контроллер серво
+
+// ============================================================================
+// setup(): Инициализация системы
+// ============================================================================
+void setup() {
+    // ========================================================================
+    // 1. Инициализация Native USB CDC (ESP32-S3)
+    // ========================================================================
+    Serial.begin(115200);
+
+    // 🔑 Таймаут для USB CDC (критично для ESP32-S3)
+    uint32_t start = millis();
+    while (!Serial && millis() - start < 3000) {
+        delay(10);
+        yield();
+    }
+    delay(500);
+
+    Serial.println("=== 🚀 UAV_ESP32S3_Core STARTUP ===");
+    Serial.println("Chip: " + String(ESP.getChipModel()) + " Rev" + String(ESP.getChipRevision()));
+    Serial.println("Heap: " + String(ESP.getFreeHeap()) + " B free");
+    Serial.flush();
+
+    // Настройка уровня логирования
+    esp_log_level_set("*", static_cast<esp_log_level_t>(CORE_DEBUG_LEVEL));
+    ESP_LOGI(TAG, "🚀 System startup | Core: %s Rev%d",
+             ESP.getChipModel(), ESP.getChipRevision());
+
+    // ========================================================================
+    // 2. Диагностика памяти
+    // ========================================================================
+    ESP_LOGI(TAG, "💾 Heap: %u B free | PSRAM: %u B",
+             ESP.getFreeHeap(), ESP.getPsramSize());
+
+    if (ESP.getPsramSize() == 0) {
+        ESP_LOGW(TAG, "⚠️ PSRAM not detected! Check board settings");
+    }
+
+    // ========================================================================
+    // 3. ✅ ШАГ 2: Инициализация модуля связи (уже работает)
+    // ========================================================================
+    ESP_LOGI(TAG, "📡 Initializing LoRa communicator...");
+    if (!lora_init()) {
+        ESP_LOGE(TAG, "❌ CRITICAL: LoRa initialization failed!");
+        pinMode(LED_BUILTIN, OUTPUT);
+        while (true) {
+            digitalWrite(LED_BUILTIN, HIGH); delay(100);
+            digitalWrite(LED_BUILTIN, LOW);  delay(400);
+        }
+    }
+    ESP_LOGI(TAG, "✅ LoRa module ready");
+
+    // ========================================================================
+    // 4. 🆕 ШАГ 4: Инициализация I2C + PCA9685
+    // ========================================================================
+    ESP_LOGI(TAG, "🔌 Initializing I2C Master...");
+    if (!i2c_manager.begin()) {
+        ESP_LOGE(TAG, "❌ CRITICAL: I2C initialization failed!");
+        // Не останавливаем систему — серво опциональны
+    } else {
+        // Сканирование шины для отладки
+        i2c_manager.scanDevices();
+
+        // Инициализация контроллера серво
+        ESP_LOGI(TAG, "🤖 Initializing PCA9685 Servo Controller...");
+        if (!servo_controller.begin(i2c_manager)) {
+            ESP_LOGE(TAG, "❌ CRITICAL: PCA9685 initialization failed!");
+            // Не останавливаем систему — серво опциональны
+        } else {
+            ESP_LOGI(TAG, "✅ PCA9685 ready | 7 servos on channels 0-6");
+
+            // 🔑 ПРЕДСТАРТОВЫЙ ТЕСТ СЕРВОПРИВОДОВ
+            ESP_LOGI(TAG, "🧪 Running servo startup test...");
+            if (!servo_controller.runServoTest()) {
+                ESP_LOGE(TAG, "❌ Servo test FAILED!");
+                // Индикация ошибки
+                pinMode(LED_BUILTIN, OUTPUT);
+                while (true) {
+                    digitalWrite(LED_BUILTIN, HIGH); delay(100);
+                    digitalWrite(LED_BUILTIN, LOW);  delay(100);
+                }
+            }
+            ESP_LOGI(TAG, "✅ Servo test completed successfully");
+        }
+    }
+
+    // ========================================================================
+    // 5. Финальный статус
+    // ========================================================================
+    ESP_LOGI(TAG, "🟢 Setup complete. Entering main loop...");
+    Serial.println("✅ System ready. Entering loop...");
+    Serial.flush();
+}
+
+// ============================================================================
+// loop(): Основной цикл
+// ============================================================================
+void loop() {
+    static uint32_t last_stats_print = 0;
+    static uint32_t tick = 0;
+
+    // ========================================================================
+    // 🔹 1. Обработка LoRa-событий (ШАГ 2 — уже работает)
+    // ========================================================================
+    lora_loop();
+
+    if (lora_packet_available()) {
+        DataComSet_t packet;
+        size_t len = lora_read_packet(&packet);
+
+        if (len > 0) {
+            ESP_LOGI(TAG, "📥 Command received | ID: %u | Up: %d | Left: %d",
+                     packet.packet_id, packet.comUp, packet.comLeft);
+
+            // ====================================================================
+            // 🔹 Обработка команд сервоприводам (ШАГ 4)
+            // ====================================================================
+            if (servo_controller.isInitialized()) {
+                servo_controller.processFlightCommands(packet.comUp, packet.comLeft);
+
+                // Обработка флага парашюта
+                if (packet.comSetAll & PARASHUT_FLAG) {
+                    ESP_LOGI(TAG, "🪂 Parachute flag detected!");
+                    servo_controller.setPhysicalAngle(4, 180);  // Канал 4 = парашют
+                }
+            }
+        }
+    }
+
+    // ========================================================================
+    // 🔹 2. Периодическая печать статистики (каждые 10 сек)
+    // ========================================================================
+    if (millis() - last_stats_print >= 10000) {
+        LoRaStats_t stats = lora_get_stats();
+        ESP_LOGI(TAG, "📊 Stats | RX: %lu/%lu | CRC: %lu | ACK: %lu/%lu | RSSI: %d dBm",
+                 stats.packets_success, stats.packets_received,
+                 stats.crc_errors,
+                 stats.acks_success, stats.acks_sent,
+                 stats.last_rssi);
+
+        // Статус серво
+        if (servo_controller.isInitialized()) {
+            ESP_LOGI(TAG, "🤖 Servos: PCA9685 @ 0x%02X | Connected: %s",
+                     servo_controller.getI2CAddress(),
+                     servo_controller.isChipConnected() ? "YES" : "NO");
+        }
+
+        last_stats_print = millis();
+    }
+
+    // ========================================================================
+    // 🔹 3. Heartbeat (каждую секунду)
+    // ========================================================================
+    ESP_LOGD(TAG, "⏱️ Tick #%lu | Heap: %u B", tick++, ESP.getFreeHeap());
+
+    // 🔹 4. Отдаём управление RTOS (критично для ESP-IDF)
+    delay(100);  // Автоматически вызывает yield()
+}
+
+📁 ПАПКА: common/
+
+=== Файл: ./common//CommonTypes.h ===
+// Проект Sender / Receiver (_Receiver_)
+// Файл :: CommonTypes.h
+//========================================
+//  Шаг 2: Создаем файл CommonTypes.h
+//========================================
+//**1. `CommonTypes.h` (исправленный)**
+/**
+* @file CommonTypes.h
+* @brief Common data structures, constants, and types for the project.
+* @version 1.1.0 - Добавлена поддержка конфигураций АКБ 3S-12S
+* @date 2026
+*/
+
+/**
+ * @file CommonTypes.h
+ * @brief Common data structures, constants, and types for the project.
+ * @version 1.0.0
+ * @date 2026
+ */
+
+#ifndef COMMON_TYPES_H
+#define COMMON_TYPES_H
+
+#pragma once
+ 
+#include <Arduino.h>
+#include <cstdint>
+#include <esp_err.h>
+//  #include "Config.h"
+//==================================================================================
+
+
+
+// 🔧 ДОБАВЛЯЕМ предварительные объявления чтобы избежать циклических зависимостей
+struct ModuleConfig; // Предварительное объявление
+
+//==================================================================================
+// 🔧 Макросы для обработки ошибок ESP-IDF
+//==================================================================================
+/**
+ * @brief Типобезопасные макросы проверки ESP-IDF ошибок
+ * @details Разделены на BOOL/VOID версии, чтобы избежать 
+ *          'return from void function' при компиляции ESP-IDF 5.0+
+ */
+#define ESP_ERROR_CHECK_RETURN_BOOL(x) do {   \
+    esp_err_t __err_rc = (x);                 \
+    if (__err_rc != ESP_OK) {                 \
+        ESP_LOGE("ERROR", "Failed at %s:%d (%s)", __FILE__, __LINE__, esp_err_to_name(__err_rc)); \
+        return false;                         \
+    }                                         \
+} while(0)
+
+#define ESP_ERROR_CHECK_RETURN_VOID(x) do {   \
+    esp_err_t __err_rc = (x);                 \
+    if (__err_rc != ESP_OK) {                 \
+        ESP_LOGE("ERROR", "Failed at %s:%d (%s)", __FILE__, __LINE__, esp_err_to_name(__err_rc)); \
+        return;                               \
+    }                                         \
+} while(0)
+
+
+#define ESP_ERROR_CHECK_VOID(x) do {          \
+    esp_err_t __err_rc = (x);                 \
+    if (__err_rc != ESP_OK) {                 \
+        ESP_LOGE("ERROR", "Failed at %s:%d (%s)", __FILE__, __LINE__, esp_err_to_name(__err_rc)); \
+        return;                               \
+    }                                         \
+} while(0)
+
+
+//==================================================================================
+// 🔋 ТАБЛИЦА КОНФИГУРАЦИЙ АККУМУЛЯТОРОВ (3S - 12S LiPo)
+//==================================================================================
+/**
+ * @struct BatteryConfig_t
+ * @brief Конфигурация для конкретного типа аккумуляторной сборки
+ * 
+ * @note Напряжения указаны для LiPo/Li-Ion элементов:
+ * - Номинал: 3.7В на ячейку
+ * - Макс: 4.2В на ячейку (полный заряд)
+ * - Мин: 3.0В на ячейку (разряд)
+ * - Крит: 2.8В на ячейку (аварийный разряд)
+ */
+struct BatteryConfig_t {
+    uint8_t cellCount;          ///< Количество ячеек (S)
+    float voltageMax;           ///< Максимальное напряжение (В) - 100%
+    float voltageNominal;       ///< Номинальное напряжение (В) - ~50%
+    float voltageMin;           ///< Минимальное напряжение (В) - 5%
+    float voltageCritical;      ///< Критическое напряжение (В) - 0%
+    const char* name;           ///< Человеко-читаемое имя
+};
+
+/**
+ * @brief Таблица поддерживаемых конфигураций АКБ
+ * @note Индекс массива = cellCount - 3 (для 3S индекс 0, для 12S индекс 9)
+ */
+constexpr BatteryConfig_t BATTERY_CONFIG_TABLE[] = {
+    {3,  12.6f, 11.1f, 9.0f,  8.4f,  "3S LiPo"},
+    {4,  16.8f, 14.8f, 12.0f, 11.2f, "4S LiPo"},
+    {5,  21.0f, 18.5f, 15.0f, 14.0f, "5S LiPo"},
+    {6,  25.2f, 22.2f, 18.0f, 16.8f, "6S LiPo"},
+    {7,  29.4f, 25.9f, 21.0f, 19.6f, "7S LiPo"},
+    {8,  33.6f, 29.6f, 24.0f, 22.4f, "8S LiPo"},
+    {9,  37.8f, 33.3f, 27.0f, 25.2f, "9S LiPo"},
+    {10, 42.0f, 37.0f, 30.0f, 28.0f, "10S LiPo"},
+    {11, 46.2f, 40.7f, 33.0f, 30.8f, "11S LiPo"},
+    {12, 50.4f, 44.4f, 36.0f, 33.6f, "12S LiPo"}
+};
+
+constexpr uint8_t BATTERY_CONFIG_COUNT = sizeof(BATTERY_CONFIG_TABLE) / sizeof(BATTERY_CONFIG_TABLE[0]);
+constexpr uint8_t MIN_CELL_COUNT = 3;
+constexpr uint8_t MAX_CELL_COUNT = 12;
+
+//==================================================================================
+// 🔋 Структура состояния батареи
+//==================================================================================
+/**
+* @struct BatteryStatus_t
+* @brief Структура состояния батареи с расширенной информацией
+*/
+struct BatteryStatus_t {
+    float voltage;              ///< Текущее напряжение (В)
+    float percentage;           ///< Процент заряда (0-100)
+    bool isOk;                  ///< Флаг нормального состояния
+    bool isLow;                 ///< Флаг низкого заряда (<20%)
+    bool isCritical;            ///< Флаг критического состояния (<5%)
+    uint32_t lastCheckTime;     ///< Время последней проверки (millis)
+    uint16_t adcValue;          ///< Сырое значение ADC (0-4095)
+    uint8_t cellCount;          ///< Количество ячеек (3-12)
+    float voltagePerCell;       ///< Напряжение на ячейку (В)
+    const char* configName;     ///< Имя конфигурации из таблицы
+};
+
+
+
+// 🔧 ПЕРЕНЕСЛИ СТРУКТУРЫ ДАННЫХ СЮДА
+    // В секцию флагов управления в comSetAll добавьте:
+    //#define STABILIZATION_FLAG     0b00000001  ///< Активация системы стабилизации
+
+// Флаги управления в comSetAll
+
+    #define COMAND_IS_EMPTY         0b00000000  ///< Отсутствуют активные ФЛАГИ
+    #define STABILIZATION_FLAG      0b00000001  ///< Активация системы стабилизации
+    #define PARASHUT_FLAG           0b00000010  ///< Активация парашюта
+    #define PHOTO_CARD_FLAG         0b00000100  ///< Запрос фотосъемки
+    #define GPS_DATA_FLAG           0b00001000  ///< Запрос GPS данных
+    #define SCREW_FLAG              0b00010000  ///< Команда поворота винтом
+    #define ACK_REQUEST_FLAG        0b00100000  ///< Запрос подтверждения приема
+    //    #define EMERGENCY_STOP     0b00100000  ///< Аварийная остановка
+    #define BATTERY_CHECK           0b01000000  ///< Запрос состояния батареи
+    #define SYSTEM_STATUS           0b10000000  ///< Запрос статуса системы
+
+// Уровни детализации отладки
+enum class DebugLevel : uint8_t  {
+    DEBUG_NONE    = 0,  // Без вывода (минимальная нагрузка)
+    DEBUG_ERRORS  = 1,  // Только критические ошибки
+    DEBUG_WARN    = 2,  // Печать предупреждений по коду
+    DEBUG_INFO    = 3,  // Печать информационных сообщений
+    DEBUG_STATS   = 4,  // Ошибки + периодическая статистика
+    DEBUG_PRINT   = 5,  // Печать отладочных сообщений Basic prints
+    DEBUG_VERBOSE = 6,  // Detailed prints
+    DEBUG_ALL     = 7   // Полная отладка (все события)
+};
+
+#pragma pack(push, 1)
+
+// --- Добавить в CommonTypes.h ---
+struct LoRaConfig_t {
+    float frequency;
+    float bandwidth;
+    uint8_t spreadingFactor;
+    uint8_t codingRate;
+    uint8_t syncWord;
+    // Добавьте другие параметры, если нужно
+};
+
+
+/**
+ * @struct DataComSet_t
+ * @brief Структура передаваемых данных управления
+ */
+struct DataComSet_t {
+    // uint8_t  preamble[2];    // 0xAA 0x55 - идентификатор начала пакета
+    uint8_t preamble[2] ;    // 0xAA 0x55 - идентификатор начала пакета
+    uint16_t packet_id = 0;      // Счетчик пакетов (0-65535)
+    uint8_t  comUp = 90;          // Команда вверх 0-255
+    uint8_t  comLeft = 90;        // Команда влево 0-255  
+    uint16_t comThrottle = 1500;    // Тяга двигателя 1000-2000
+    uint8_t  comParashut = 0;    // Парашют 0/1
+    uint32_t timestamp = 0;      // Временная метка (millis())
+    uint8_t  comSetAll = 0;      // Битовая маска команд
+    uint8_t  crc8 = 0;           // Контрольная сумма
+};
+
+/**
+ * @struct AckPacket_t  
+ * @brief Структура подтверждения приема
+ */
+struct AckPacket_t {
+    // uint8_t preamble[2];     // 0x55 0xAA - идентификатор ACK
+    uint8_t preamble[2] ;     // 0x55 0xAA - идентификатор ACK
+    uint16_t packet_id = 0;      // ID подтверждаемого пакета
+    uint32_t timestamp = 0;      // Время отправки пакета
+    uint8_t status = 0;          // Статус получения (1-OK, 0-ERROR)
+    uint8_t crc8 = 0;            // Контрольная сумма
+};
+
+// 🔧 ПЕРЕНЕСЛИ РАЗМЕРЫ БУФЕРОВ И ВАЛИДАЦИЮ 
+constexpr uint8_t MAX_PACKET_SIZE = sizeof(DataComSet_t);
+constexpr uint8_t ACK_PACKET_SIZE = sizeof(AckPacket_t);
+
+// ================== ВАЛИДАЦИЯ КОНФИГУРАЦИИ ==================
+static_assert(sizeof(DataComSet_t) == 15, "Invalid DataComSet_t size");
+static_assert(sizeof(AckPacket_t) == 10, "Invalid AckPacket_t size");
+
+
+// Удобные макросы для доступа к данным датчиков
+#define GYRO_X(sd) ((sd).gyro.x)
+#define GYRO_Y(sd) ((sd).gyro.y)
+#define GYRO_Z(sd) ((sd).gyro.z)
+
+#define ACCEL_X(sd) ((sd).accel.x)
+#define ACCEL_Y(sd) ((sd).accel.y)
+#define ACCEL_Z(sd) ((sd).accel.z)
+
+#define MAG_X(sd) ((sd).mag.x)
+#define MAG_Y(sd) ((sd).mag.y)
+#define MAG_Z(sd) ((sd).mag.z)
+
+/**
+* @struct SensorData
+* @brief Данные сенсора GY-87 (MPU6050 + HMC5883L + BMP180)
+*/
+/*   
+struct SensorData {
+    uint32_t timestamp;  // Временная метка
+    
+    // Сырые данные MPU6050
+    float accel[3];      // Акселерометр (g)
+    float gyro[3];       // Гироскоп (°/с)
+    float temp;          // Температура MPU6050
+    
+    // HMC5883L магнитометр
+    float mag[3];        // Магнитометр (μT)
+    float heading;       // Расчетный курс (°)
+    
+    // BMP180 барометр
+    float pressure;      // Давление (гПа)
+    float altitude;      // Высота (м)
+    float temperature;   // Температура BMP180 (°C)
+    
+    // 🔑 КЛЮЧЕВОЕ ДОПОЛНЕНИЕ: УГЛЫ ЭЙЛЕРА ДЛЯ СТАБИЛИЗАЦИИ ПОЛЁТА 🔑
+    float roll;          // Крен (ось X) -90°..+90°
+    float pitch;         // Тангаж (ось Y) -90°..+90°
+    float yaw;           // Рыскание (ось Z) 0°..360°
+    
+    uint8_t status;      // Статус (битовая маска)
+};
+*/
+
+/**
+ * @struct SensorData
+ * @brief Данные сенсора GY-87 с углами Эйлера для стабилизации
+ * 
+ * @note ВАЖНО: Структура расширена полями углов Эйлера и статуса
+ * для совместимости с системой стабилизации полёта.
+ */
+struct SensorData {
+    // Сырые данные датчиков MPU6050
+    struct { float x, y, z; } gyro;    ///< Гироскоп (рад/с)
+    struct { float x, y, z; } accel;   ///< Акселерометр (м/с²)
+    struct { float x, y, z; } mag;     ///< Магнитометр (мкТ)
+
+    // HMC5883L магнитометр
+    // float mag[3];        // Магнитометр (μT)
+    float heading;       // Расчетный курс (°)
+  
+  // Производные данные (вычисляются в GY87_Handler)
+    // 🔑 КЛЮЧЕВОЕ ДОПОЛНЕНИЕ: УГЛЫ ЭЙЛЕРА ДЛЯ СТАБИЛИЗАЦИИ ПОЛЁТА 🔑
+    float roll;          ///< Крен (ось X) -90°..+90°
+    float pitch;         ///< Тангаж (ось Y) -90°..+90°
+    float yaw;           ///< Рыскание (ось Z) 0°..360°
+  
+    // Данные барометра
+    float temperature;   ///< Температура BMP180 (°C)
+    float pressure;      ///< Давление (гПа)
+    float altitude;      ///< Высота (м)
+  
+    // Статус датчика (битовая маска)
+    uint8_t status;      ///< 0x01 = данные валидны, 0x02 = калибровка завершена
+  
+    // Конструктор по умолчанию
+    SensorData() : roll(0), pitch(0), yaw(0), temperature(0), 
+                    pressure(0), altitude(0), status(0) {}
+};
+
+
+/**
+ * @struct ModuleStats_t
+ * @brief Статистика работы модуля
+ */
+struct ModuleStats_t {
+    uint32_t tx_packets;             // Отправленные пакеты
+    uint32_t rx_packets;             // Принятые пакеты
+    uint32_t crc_errors;             // Ошибки CRC
+    uint32_t tx_errors;              // Ошибки передачи
+    uint32_t rx_errors;              // Ошибки приема
+    int16_t last_rssi;               // Последний RSSI
+    uint32_t resets;                 // Сбросы модуля
+    uint32_t reconnects;             // Переподключения
+    uint32_t aux_timeouts;           // Таймауты AUX
+    uint32_t busy_errors;            // Ошибки занятости
+    uint32_t not_ready_errors;       // Ошибки неготовности
+    uint32_t connection_lost_events; // Потеря соединения
+    uint32_t receive_timeouts;       // Таймауты приема
+    uint16_t preamble_errors;        // Ошибки преамбулы
+};
+
+// ============================================================================
+// STRUCTS
+// ============================================================================
+/**
+ * @brief Статистика приёмника
+ */
+struct ReceiverStats {
+    uint32_t packetsReceived = 0;
+    uint32_t packetsReceivedSuccess = 0;
+    uint32_t crcErrors = 0;
+    uint32_t invalidPreamble = 0;
+    uint32_t duplicatePackets = 0;
+    uint32_t packetErrors = 0;
+    uint32_t lastPacketTime = 0;
+    int16_t lastRSSI = 0;
+    float lastSNR = 0.0f;
+    uint32_t fsmErrors = 0;
+    uint32_t recoveryAttempts = 0;
+    
+    // ACK stats
+    uint32_t acksSent = 0;
+    uint32_t acksSentSuccess = 0;
+    uint32_t ackSendErrors = 0;
+    uint32_t ackRequests = 0;
+    uint32_t ackResponses = 0;
+    uint32_t ackErrors = 0;
+    uint32_t ackTimeouts = 0;
+    float ackSuccessRate = 0.0f;
+    
+    // 🆕 ДОБАВЛЕНО: Счетчик таймаутов приема (DIO1)
+    uint32_t receive_timeouts = 0; 
+};
+
+#pragma pack(pop)
+
+// ================== ПЕРЕЧИСЛЕНИЯ ==================
+/**
+ * @enum SystemState
+ * @brief Состояния системы
+ */
+enum class SystemState {
+    BOOT,           // Загрузка системы
+    INITIALIZING,   // Инициализация компонентов  
+    STANDBY,        // Ожидание команд
+    ACTIVE,         // Активная работа
+    ERROR,          // Ошибка системы
+    RECOVERY        // Восстановление
+};
+
+constexpr uint32_t MODULE_UPDATE_INTERVAL = 100;
+/**
+ * @enum EbyteStatus
+ * @brief Статусы операций модуля E49
+ */
+enum class EbyteStatus {
+    SUCCESS,                        // Успешное выполнение
+    ERROR_INIT,                     // Ошибка инициализации
+    ERROR_SEND,                     // Ошибка отправки
+    ERROR_RECEIVE,                  // Ошибка приема
+    ERROR_CRC,                      // Ошибка контрольной суммы
+    ERROR_AUX_TIMEOUT,              // Таймаут AUX пина
+    ERROR_NO_NEW_DATA,              // Нет новых данных
+    ERROR_INVALID_DATA,             // Невалидные данные
+    ERROR_INVALID_PREAMBLE,         // Неправильная преамбула
+    ERROR_PREAMBLE,                 // Ошибка преамбулы
+    ERROR_SEND_FAILED,              // Сбой отправки
+    ERROR_RECEIVE_FAILED,           // Сбой приема
+    ERROR_MODULE_NOT_RESPONDING,    // Модуль не отвечает
+    ERROR_INVALID_STATE,            // Неверное состояние
+    ERROR_BUSY,                     // Модуль занят
+    ERROR_NOT_READY,                // Модуль не готов
+    ERROR_CONNECTION_LOST,          // Потеря соединения
+    EBYTE_ERROR_ACK_TIMEOUT,        // Таймаут подтверждения
+    EBYTE_OPERATION_PENDING         // Операция в процессе
+};
+
+
+// В Receiver.ino — ДО setup()
+// ControllerDebug_t CDebug = {
+struct ControllerDebug_t {
+  bool recieve ;
+  bool sender;
+  bool lora ;
+  bool motors ;
+  bool servos;
+  bool ledc ;
+  bool slide_pot ;
+  bool joystick ;
+  bool cc ; 
+};
+
+
+/**
+ * @class TimerMillis
+ * @brief Работа с таймерами
+ */
+class TimerMillis
+{
+  private:
+    static constexpr uint32_t  MIN_INTERVAL = 1;     //
+    uint32_t                   last         = 0;     //
+    uint32_t                   interval     = MIN_INTERVAL;
+
+  public:
+    // Конструктор по умолчанию
+    TimerMillis() 
+    {
+        reset(); // Инициализируем временем создания
+    }
+
+    // Конструктор с интервалом
+    TimerMillis(uint32_t _interval) 
+    {
+        setInterval(_interval);
+        reset();
+    }
+
+    // Сброс таймера
+    void reset() 
+    {
+    last = millis();
+    }
+
+    // Проверка готовности таймера
+    bool is_ready()
+    {
+    uint32_t current = millis();
+    
+    // ✅ БЕЗОПАСНОЕ СРАВНЕНИЕ С УЧЕТОМ ПЕРЕПОЛНЕНИЯ
+    if ((current - last) >= interval) 
+    {
+        last = current; // Обновляем время последнего срабатывания
+        return true;
+    }
+    return false;
+    }
+
+    // Установка интервала
+    void setInterval(uint32_t _interval) 
+    {
+        interval = (_interval < MIN_INTERVAL) ? MIN_INTERVAL : _interval;
+    }
+
+    // Получение текущего интервала
+    uint32_t getInterval() const 
+    {
+        return interval;
+    }
+
+    // Получение прошедшего времени
+    uint32_t getElapsed() const 
+    {
+    return millis() - last;
+    }
+
+    // Получение оставшегося времени
+    uint32_t getRemaining() const 
+    {
+    uint32_t elapsed = getElapsed();
+    return (elapsed >= interval) ? 0 : (interval - elapsed);
+    }
+};
+
+    // #endif // end TimerMillis_h
+
+
+/**
+ * @class BitMask
+ * @brief Работа с битовыми масками
+ */
+class BitMask {
+private:
+    uint8_t mask;
+public:
+    BitMask() : mask(0) {}
+    explicit BitMask(uint8_t initialMask) : mask(initialMask) {}
+    
+    /**
+     * @brief Установка бита
+     * @param bit Номер бита (0-7)
+     * @param value Значение (true/false)
+     */
+    void setBit(uint8_t bit, bool value) {
+        if (bit > 7) return;
+        if (value) {
+            mask |= (1 << bit);
+        } else {
+            mask &= ~(1 << bit);
+        }
+    }
+    
+    /**
+     * @brief Чтение бита
+     * @param bit Номер бита (0-7)
+     * @return Значение бита
+     */
+    bool getBit(uint8_t bit) const {
+        if (bit > 7) return false;
+        return (mask & (1 << bit)) != 0;
+    }
+
+    /**
+     * @brief Очистка бита
+     * @param bit Номер бита (0-7)
+     */
+    void clearBit(uint8_t bit) {
+        mask &= ~(1 << bit); 
+    }
+
+    /**
+     * @brief Вывод битовой маски в двоичном формате
+     */
+    void printBinary() const {
+        Serial.print("0b");
+        for (int i = 7; i >= 0; i--) {
+            Serial.print(getBit(i) ? "1" : "0");
+        }
+    }
+
+    /**
+     * @brief Получение маски
+     * @return Текущая битовая маска
+     */
+    uint8_t getMask() const { 
+        return mask; 
+    }
+
+    /**
+     * @brief Установка маски
+     * @param newMask Новая битовая маска
+     */
+    void setMask(uint8_t newMask) { 
+        mask = newMask; 
+    }
+    
+    /**
+     * @brief Отладочный вывод маски
+     * @param name Имя маски для вывода
+     */
+    void printDebug(const char* name) const {
+        Serial.printf("%s: ", name);
+        printBinary();
+        Serial.printf(" (0x%02X)\n", mask);
+    }
+};
+
+// Добавить в CommonTypes.h или LoRaCommunicator.h
+/**
+ * @brief Печать содержимого структуры DataComSet_t
+ * @param data Структура данных для печати
+ * @param source Источник данных (для заголовка)
+ */ 
+void printDataComSet(const DataComSet_t& data, const char* source);
+
+// В CommonTypes.h — после структур
+//uint8_t calculateCRC8(const uint8_t* data, size_t length);
+
+// В самом конце CommonTypes.h, перед #endif
+uint8_t calculateCRC8(const uint8_t* data, size_t length);
+
+// Глобальная переменная отладки — объявляется ОДИН РАЗ
+extern ControllerDebug_t CDebug;
+
+
+#endif // COMMON_TYPES_H
+
+=== Файл: ./common//types.h ===
+/**
+ * @file types.h
+ * @brief Общие типы данных, структуры пакетов и макросы
+ * @details Адаптировано из CommonTypes.h. Содержит только необходимое для LoRa модуля.
+ * @version 1.0
+ */
+#pragma once
+#include <Arduino.h>
+#include <cstdint>
+#include <esp_log.h>
+
+// ============================================================================
+// 📦 Структуры пакетов (упакованы для точного размера)
+// ============================================================================
+#pragma pack(push, 1)
+struct DataComSet_t {
+    uint8_t  preamble[2] = {0xAA, 0x55};
+    uint16_t packet_id = 0;
+    uint8_t  comUp = 90;
+    uint8_t  comLeft = 90;
+    uint16_t comThrottle = 1500;
+    uint8_t  comParashut = 0;
+    uint32_t timestamp = 0;
+    uint8_t  comSetAll = 0;
+    uint8_t  crc8 = 0;
+};
+
+struct AckPacket_t {
+    uint8_t  preamble[2] = {0x55, 0xAA};
+    uint16_t packet_id = 0;
+    uint32_t timestamp = 0;
+    uint8_t  status = 0;
+    uint8_t  crc8 = 0;
+};
+#pragma pack(pop)
+
+// Проверка размеров на этапе компиляции (защита от ошибок выравнивания)
+static_assert(sizeof(DataComSet_t) == 15, "Invalid DataComSet_t size");
+static_assert(sizeof(AckPacket_t) == 10,  "Invalid AckPacket_t size");
+
+// ============================================================================
+// 🔑 Флаги команд (битовая маска comSetAll)
+// ============================================================================
+#define COMAND_IS_EMPTY         0b00000000
+#define STABILIZATION_FLAG      0b00000001
+#define PARASHUT_FLAG           0b00000010
+#define PHOTO_CARD_FLAG         0b00000100
+#define GPS_DATA_FLAG           0b00001000
+#define SCREW_FLAG              0b00010000
+#define ACK_REQUEST_FLAG        0b00100000
+#define BATTERY_CHECK           0b01000000
+#define SYSTEM_STATUS           0b10000000
+
+// ============================================================================
+// 📊 Статистика приёмника
+// ============================================================================
+struct ReceiverStats {
+    uint32_t packetsReceived = 0;
+    uint32_t packetsSuccess = 0;
+    uint32_t crcErrors = 0;
+    uint32_t acksSent = 0;
+    uint32_t acksSuccess = 0;
+    int16_t  lastRssi = -999;
+    uint32_t lastPacketTime = 0;
+};
+
+// ============================================================================
+// 🔧 CRC8 прототип
+// ============================================================================
+uint8_t calculateCRC8(const uint8_t* data, size_t length);
+
+// ============================================================================
+// 🎚️ Уровни отладки
+// ============================================================================
+enum class DebugLevel : uint8_t {
+    DEBUG_NONE = 0, DEBUG_ERRORS = 1, DEBUG_WARN = 2,
+    DEBUG_INFO = 3, DEBUG_STATS = 4, DEBUG_PRINT = 5,
+    DEBUG_VERBOSE = 6, DEBUG_ALL = 7
+};
+
+📁 ПАПКА: config/
+
+=== Файл: ./config//pins.h ===
+
+/**
+ * @file pins.h
+ * @brief Конфигурация пинов и параметров радио для ESP32-S3-N16R8
+ * @details 
+ * - Адаптировано из оригинального Config.h
+ * - Все пины проверены на отсутствие конфликтов с USB, Flash и PSRAM
+ * 
+ * @note ESP32-S3 НЕ имеет аппаратных дефолтов для SPI/I2C. Пины задаются явно!
+ * @version 1.0 (Миграция в PlatformIO)
+ */
+#pragma once
+#include <cstdint>
+#include <driver/ledc.h>
+
+namespace Config {
+namespace Pins {
+    // ============================================================================
+    // 📡 LoRa SX1278 (SPI через FSPI)
+    // ============================================================================
+    // ⚠️ Ограничения ESP32-S3:
+    // GPIO 45-48: Flash/PSRAM (КРИТИЧЕСКИ не трогать!)
+    // GPIO 19-20: Native USB (не использовать для периферии)
+    // GPIO 0: Boot strapping
+    
+    // FSPI шина (стандартная для ESP32-S3)
+    constexpr uint8_t LORA_CS    = 10; // FSPI CS-NSS
+    constexpr uint8_t LORA_SCLK  = 12; // FSPI Clock
+    constexpr uint8_t LORA_MISO  = 13; // FSPI MISO
+    constexpr uint8_t LORA_MOSI  = 11; // FSPI MOSI
+    
+    // Управляющие пины LoRa
+    constexpr uint8_t LORA_RST   = 15; // Reset (перенесен с 9 для избежания конфликта с I2C)
+    constexpr uint8_t LORA_DIO0  = 4;  // Прерывание: пакет принят (RxDone)
+    constexpr uint8_t LORA_DIO1  = 14; // Прерывание: таймаут приёма (RxTimeout)
+
+    // --- I2C Шина (Общая для MPU9250, PCA9685) ---
+    constexpr uint8_t I2C_SDA    = 8;
+    constexpr uint8_t I2C_SCL    = 9; // Конфликт с RST(9) устранен (RST -> 15)
+
+} //END namespace Pins
+
+    // =========================================================================
+    // ПАРАМЕТРЫ РАДИО (LoRa)
+    // =========================================================================
+    namespace Radio {
+        // ============================================================================
+        // 🔧 ФЛАГИ УСЛОВНОЙ КОМПИЛЯЦИИ LoRa
+        // ============================================================================
+        /**
+        * @brief Флаг поддержки DIO1 для SX1278
+        * @details Установите в 1 для модулей с DIO1 (RadioLib 7.6.0+)
+        *          Установите в 0 для старых модулей (только DIO0)
+        * @note Все пины остаются зафиксированными в Config::Pins
+        */
+        #ifndef LORA_ENABLE_DIO1
+        #define LORA_ENABLE_DIO1 1  // 🔑 ИЗМЕНИТЬ: 1 => с DIO1, 0 = только DIO0
+        #endif
+
+        // ============================================================================
+        // 🔧 АВТОПРОВЕРКА КОНФИГУРАЦИИ (compile-time assert)
+        // ============================================================================
+        // ✅ СТАЛО (ИСПРАВЛЕНО):
+        #if LORA_ENABLE_DIO1
+            // 🔑 static_assert выполняется на этапе компиляции C++ и корректно 
+            //    проверяет constexpr константы из namespace Config
+            static_assert(Config::Pins::LORA_DIO1 != RADIOLIB_NC,
+                    "❌ ОШИБКА: LORA_ENABLE_DIO1=1, но Config::Pins::LORA_DIO1 не задан (равен RADIOLIB_NC)!");
+        #endif        
+        //====================================================
+
+        constexpr uint16_t TRANSCEIVER_DELAY = 850;
+        constexpr uint16_t CONNECTION_CHECK_INTERVAL = 10000;
+        constexpr uint16_t DATA_SEND_INTERVAL = 1000;
+        constexpr uint16_t ACK_REQUEST_INTERVAL = 17;
+
+        constexpr uint16_t TRANSMIT_INTERVAL = 500;
+        constexpr uint16_t AUX_TIMEOUT_MS = 300;
+        constexpr uint16_t RECEIVE_TIMEOUT_MS = 1000;
+        constexpr uint16_t AUX_WAIT_TIMEOUT_MS = 500;
+        constexpr uint16_t SEND_INTERVAL_MS = 50; // 20 Гц // или 200,// Transmitter
+        constexpr  bool    REQUEST_ACK = true; // или false — зависит от режима        
+ 
+        // 🔧 ОБНОВИТЬ для SX1278  CRC
+        //====================================================
+        constexpr float FREQUENCY = 433.0f;     // MHz
+        constexpr uint8_t SPREADING_FACTOR = 7;   // 7-12 SF7
+        constexpr float BANDWIDTH = 125.0f;     // kHz (125 kHz) - ДОПУСТИМОЕ ЗНАЧЕНИЕ ДЛЯ SX1278
+        constexpr uint8_t CODING_RATE = 5;      // 5-8 (4/5) // 5 -> 4/5, 6 -> 4/6, etc.
+        constexpr uint8_t OUTPUT_POWER = 14;    // dBm (обычно 2-20dBm)  // dBm (max 17 for high power modules)
+        constexpr uint8_t PREAMBLE_LEN = 8;     // символов // Number of symbols
+        constexpr uint8_t SYNC_WORD = 0x12;     // 0x12 - стандартное, 0x34 - пример
+
+        // --- Параметры работы ---
+        // constexpr uint32_t SEND_INTERVAL_MS = 50; // 20 Гц
+        constexpr uint32_t ACK_TIMEOUT_MS = 20; // 20 мс (только для передатчика)
+        constexpr uint8_t RX_PRINT_INTERVAL = 16; // Печатать каждый N-й пакет
+        constexpr uint8_t TX_PRINT_INTERVAL = 10;    // Каждые 10 пакетов
+    };  // end namespace Radio
+
+
+    namespace Timing {   
+
+            // Таймауты и интервалы
+        constexpr uint16_t TX_TIMEOUT_MS = 200;
+        constexpr uint16_t RX_TIMEOUT_MS = 200;
+        constexpr uint16_t ACK_TIMEOUT_MS = 300; // заменим старый ACK_TIMEOUT
+        constexpr uint16_t RESEND_DELAY_MS = 100; // заменим старый RESEND_DELAY
+        constexpr uint8_t MAX_RETRIES = 2;
+        constexpr uint16_t STATS_PRINT_INTERVAL_MS = 3500 ;
+ 
+        // Неблокирующие таймеры
+        constexpr uint32_t SYSTEM_TEST_INTERVAL = 100;
+        constexpr uint32_t SERVO_TEST_DURATION = 3000;
+        constexpr uint32_t MOTOR_TEST_DURATION = 2000;
+        constexpr uint32_t STATUS_UPDATE_INTERVAL = 5000;
+        
+        // Таймауты инициализации
+        constexpr uint32_t INIT_TIMEOUT_MS = 5000;
+        constexpr uint32_t MODULE_INIT_DELAY = 100;
+        constexpr uint32_t PRINT_DATACOMSET_INTERVAL = 17 ; // Интервал печати поступивших в RECEIVER данных
+        // LED индикация
+        constexpr uint8_t LED_PIN = 2; // Используем LED_STATUS пин
+        constexpr uint16_t LED_BLINK_INTERVAL_MS = 100;
+
+            //  namespace Timing {
+        constexpr uint32_t PACKET_FRESHNESS_MS = 10000;  // Свежесть пакета
+        constexpr uint32_t CONNECTION_TIMEOUT_MS = 5000; // Таймаут соединения
+            //  };
+
+    }; // end namespace Timing 
+
+
+    //        namespace Timing {
+    //            constexpr uint32_t STATS_PRINT_INTERVAL_MS = 3500;
+    //            constexpr uint32_t CONNECTION_TIMEOUT_MS   = 5000;
+    //        } //END namespace Timing
+} //END namespace Config
+
+📁 ПАПКА: core/
+
+📁 ПАПКА: modules/
+
+📁 ПАПКА: modules//filter_manager/
+
+=== Файл: ./modules//filter_manager//FilterManager.h ===
+
+
+/**
+ * @file filter_manager.h
+ * @brief Менеджер переключения фильтров ориентации (Махони/Мэджвик)
+ * @details
+ * - Адаптивные параметры на основе уровня вибраций
+ * - Безопасное переключение без скачков ориентации
+ * - Поддержка 6-осевого (аксел+гироскоп) и 9-осевого (с магнитометром) режимов
+ */
+#pragma once
+#ifndef FILTER_MANAGER_H
+#define FILTER_MANAGER_H
+
+#include "common/types.h"
+
+#include "modules/filter_manager/MahonyFilter.h"
+#include "modules/filter_manager/MadgwickFilter.h"
+#include "modules/vibration/VibrationEstimator.h"
+
+// #include "modules/filter/mahony_filter.h"
+// #include "modules/filter/madgwick_filter.h"
+// #include "modules/vibration/vibration_estimator.h"
+
+enum class FilterType { MAHONY, MADGWICK };
+
+class FilterManager {
+public:
+    FilterManager();
+
+    bool begin(float sampleFreqHz = 250.0f);  // 250 Гц для ESP32-S3
+
+    // 🔑 Адаптивность одной командой
+    void enableAdaptive(bool enable);
+    bool isAdaptiveEnabled() const { return _adaptiveEnabled; }
+
+    // 🔑 Основной метод обновления (вызывать 250 раз/сек)
+    void update(float dt, float ax, float ay, float az,
+                float gx, float gy, float gz,
+                float mx = 0.0f, float my = 0.0f, float mz = 0.0f);
+
+    // Получение ориентации
+    void getQuaternion(float &w, float &x, float &y, float &z) const;
+    void getEuler(float &roll, float &pitch, float &yaw) const;
+
+    // Переключение фильтра (безопасно в полёте)
+    void requestSwitch(FilterType type);
+    FilterType getActiveType() const { return _currentType; }
+
+    // Диагностика
+    const char* getActiveFilterName() const;
+    float getCurrentVibrationLevel() const { return _vibEstimator.getVibrationLevel(); }
+
+private:
+    MahonyFilter _mahony;
+    MadgwickFilter _madgwick;
+    VibrationEstimator _vibEstimator;
+
+    ISensorFilter* _activeFilter;
+    FilterType _currentType;
+
+    // Безопасное переключение
+    volatile bool _pendingSwitch;
+    FilterType _pendingType;
+
+    bool _adaptiveEnabled = false;
+
+    static const char* TAG;
+};
+
+#endif // FILTER_MANAGER_H
+
+=== Файл: ./modules//filter_manager//ISensorFilter.h ===
+
+
+// ### 📄 2. `ISensorFilter.h` (Расширение интерфейса)
+// cpp
+// 
+
+#pragma once
+#include <Arduino.h>
+
+class ISensorFilter {
+public:
+    virtual ~ISensorFilter() = default;
+    virtual void begin(float sampleFreqHz) = 0;
+    virtual void update(float dt, float ax, float ay, float az, 
+                        float gx, float gy, float gz, 
+                        float mx = 0.0f, float my = 0.0f, float mz = 0.0f) = 0;
+    virtual void getQuaternion(float &w, float &x, float &y, float &z) const = 0;
+    virtual void getEuler(float &roll, float &pitch, float &yaw) const = 0;
+    virtual void setInitialState(float roll, float pitch, float yaw) = 0;
+    virtual const char* getName() const = 0;
+    
+    // 🔑 НОВЫЙ МЕТОД: Адаптивная подстройка (по умолчанию ничего не делает)
+    virtual void setAdaptiveParams(float vibrationLevel) { (void)vibrationLevel; }
+    virtual bool isAdaptiveEnabled() const { return false; }
+};
+
+=== Файл: ./modules//filter_manager//MadgwickFilter.h ===
+
+
+// ### 📁 3. Фильтр Мэджвика `MadgwickFilter.h` / `.cpp`
+// Алгоритм градиентного спуска. Меньше дрейф, 
+// чуть выше нагрузка на CPU (но ESP32 справится легко).
+//  MadgwickFilter.h 
+// ### 📄 4. `MadgwickFilter.h` / `.cpp` (Адаптивный)
+// Логика:  При вибрациях уменьшаем `beta` (шаг градиентного 
+// спуска). Фильтр начинает больше доверять гироскопу и 
+// игнорировать зашумлённый акселерометр.
+
+// cpp
+// 
+#pragma once
+#include "modules/filter_manager/ISensorFilter.h"
+//#include "moISensorFilter.h"
+
+class MadgwickFilter : public ISensorFilter {
+public:
+    MadgwickFilter();
+    void begin(float sampleFreqHz) override;
+    void update(float dt, float ax, float ay, float az, float gx, float gy, float gz, 
+                float mx = 0.0f, float my = 0.0f, float mz = 0.0f) override;
+    void getQuaternion(float &w, float &x, float &y, float &z) const override;
+    void getEuler(float &roll, float &pitch, float &yaw) const override;
+    void setInitialState(float roll, float pitch, float yaw) override;
+    const char* getName() const override { return "Madgwick"; }
+    void setBeta(float beta);
+
+    void setAdaptiveParams(float vibrationLevel) override;
+    bool isAdaptiveEnabled() const override { return _adaptiveEnabled; }
+    void setAdaptiveEnabled(bool enable) { _adaptiveEnabled = enable; }
+
+private:
+    float q0, q1, q2, q3;
+    float beta;
+
+   
+    // 🔑 АДАПТИВНОСТЬ (добавлено для устранения ошибок компиляции)
+    bool _adaptiveEnabled = false;
+    float _baseBeta = 0.04f;
+    float _minBeta = 0.008f;
+    float _maxBeta = 0.12f;    
+};
+
+=== Файл: ./modules//filter_manager//MahonyFilter.h ===
+// ### 📁 2. Фильтр Махони `MahonyFilter.h` / `.cpp`
+// Классический алгоритм с ПИ-коррекцией дрейфа. 
+// Быстрый, стабильный.
+// **Логика:** При вибрациях уменьшаем `Kp` 
+// (меньше реакции на шумный акселерометр) и обнуляем 
+// `Ki` (защита от насыщения интегратора).
+// MahonyFilter.h 
+
+// cpp
+// 
+#pragma once
+#include "ISensorFilter.h"
+
+class MahonyFilter : public ISensorFilter {
+public:
+    MahonyFilter();
+    void begin(float sampleFreqHz) override;
+    void update(float dt, float ax, float ay, float az, float gx, float gy, float gz, 
+                float mx = 0.0f, float my = 0.0f, float mz = 0.0f) override;
+    void getQuaternion(float &w, float &x, float &y, float &z) const override;
+    void getEuler(float &roll, float &pitch, float &yaw) const override;
+    void setInitialState(float roll, float pitch, float yaw) override;
+    const char* getName() const override { return "Mahony"; }
+    void setGains(float kp, float ki);
+
+    void setAdaptiveParams(float vibrationLevel) override;
+    bool isAdaptiveEnabled() const override { return _adaptiveEnabled; }
+    void setAdaptiveEnabled(bool enable) { _adaptiveEnabled = enable; }
+
+private:
+    float q0, q1, q2, q3;
+    float twoKp, twoKi;
+    float exInt, eyInt, ezInt;
+
+    bool _adaptiveEnabled = false;
+    float _baseKp = 2.0f, _baseKi = 0.002f; // Базовые коэффициенты
+    float _minKp = 0.5f, _maxKp = 3.0f;
+    float _minKi = 0.0f, _maxKi = 0.005f;
+
+};
+
+=== Файл: ./modules//filter_manager//FilterManager.cpp ===
+
+
+
+// FilterManager.cpp 
+// 
+// 
+#include "modules/filter_manager/FilterManager.h"
+// #include "FilterManager.h"
+
+FilterManager::FilterManager() : _activeFilter(&_mahony), _currentType(FilterType::MAHONY), 
+                                 _pendingSwitch(false), _pendingType(FilterType::MAHONY) {}
+
+void FilterManager::begin(float sampleFreqHz) {
+    _mahony.begin(sampleFreqHz);
+    _madgwick.begin(sampleFreqHz);
+    _vibEstimator.configure(0.15f, 0.05f, 1.5f); // Настройка вибрационного монитора
+    _activeFilter = &_mahony;
+    _currentType = FilterType::MAHONY;
+}
+
+void FilterManager::enableAdaptive(bool enable) {
+    _adaptiveEnabled = enable;
+    _mahony.setAdaptiveEnabled(enable);
+    _madgwick.setAdaptiveEnabled(enable);
+}
+
+void FilterManager::update(float dt, float ax, float ay, float az, float gx, float gy, float gz, float mx, float my, float mz) {
+    if (_pendingSwitch) {
+        float w, x, y, z, roll, pitch, yaw;
+        _activeFilter->getQuaternion(w, x, y, z);
+        _activeFilter->getEuler(roll, pitch, yaw);
+        if (_pendingType == FilterType::MAHONY) _mahony.setInitialState(roll, pitch, yaw);
+        else _madgwick.setInitialState(roll, pitch, yaw);
+        _currentType = _pendingType;
+        _pendingSwitch = false;
+    }
+    
+    // 🔑 АДАПТИВНАЯ ПОДСТРОЙКА ПЕРЕД КАЖДЫМ ШАГОМ
+    float vibLevel = _vibEstimator.compute(ax, ay, az);
+    _activeFilter->setAdaptiveParams(vibLevel);
+    
+    _activeFilter->update(dt, ax, ay, az, gx, gy, gz, mx, my, mz);
+}
+
+void FilterManager::getQuaternion(float &w, float &x, float &y, float &z) const { _activeFilter->getQuaternion(w, x, y, z); }
+void FilterManager::getEuler(float &roll, float &pitch, float &yaw) const { _activeFilter->getEuler(roll, pitch, yaw); }
+
+=== Файл: ./modules//filter_manager//MadgwickFilter.cpp ===
+
+
+// MadgwickFilter.cpp 
+// cpp
+// 
+#include "MadgwickFilter.h"
+#include <math.h>
+#pragma GCC optimize("O3")
+
+MadgwickFilter::MadgwickFilter() : q0(1.0f), q1(0.0f), q2(0.0f), q3(0.0f), beta(0.02f) {}
+void MadgwickFilter::begin(float sampleFreqHz) { beta = 0.02f; q0=1.0f; q1=q2=q3=0.0f; }
+void MadgwickFilter::setBeta(float b) { beta = b; }
+
+void MadgwickFilter::update(float dt, float ax, float ay, float az, float gx, float gy, float gz, float mx, float my, float mz) {
+    float recipNorm;
+    // float s0, s1, s2, s3, normS;
+    float s0, s1, s2, s3;
+    float qDot1, qDot2, qDot3, qDot4;
+    float hx, hy;
+    // Строки 36,41,42,64,65: Инициализация и исправление области видимости
+    float _2q0 = 0.0f, _2q1 = 0.0f, _2q2 = 0.0f, _2q3 = 0.0f; // ← Инициализация в начале функции
+    float _8q1 = 0.0f, _8q2 = 0.0f, _4q0 = 0.0f, invS = 0.0f, normS = 0.0f; // ← Тоже
+    // float _8q1 = 0.0f, _8q2 = 0.0f ; // ← Тоже
+
+    // float _2q0mx, _2q0my, _2q0mz, _2q1mx, _2bx, _2bz, _4bx, _4bz, _2q0, _2q1, _2q2, _2q3, _2q0q2, _2q2q3, q0q0, q0q1, q0q2, q0q3, q1q1, q1q2, q1q3, q2q2, q2q3, q3q3;
+    float _2q0mx, _2q0my, _2q0mz, _2q1mx, _2bx, _2bz, _4bx, _4bz,_2q0q2, _2q2q3, q0q0, q0q1, q0q2, q0q3, q1q1, q1q2, q1q3, q2q2, q2q3, q3q3;
+    // float _8q1, _8q2, _4q0, invS ;
+;
+
+                            // Альтернатива : Добавить `(void)varname;` для подавления предупреждений, 
+                            // если переменные нужны для будущей 9-осевой поддержки:
+                            // Для временного подавления предупреждений:
+                            //(void)invS; (void)_4q0; (void)_8q1; (void)_8q2; (void)normS;
+                            //(void)s0; (void)s1; (void)s2; (void)s3; (void)hx; (void)hy;
+                            //(void)_2q1mx; (void)_2q0q2; (void)_2q2q3; (void)q0q0; (void)q0q3;
+
+    q0q0 = q0*q0; q0q1 = q0*q1; q0q2 = q0*q2; q0q3 = q0*q3;
+    q1q1 = q1*q1; q1q2 = q1*q2; q1q3 = q1*q3; q2q2 = q2*q2; q2q3 = q2*q3; q3q3 = q3*q3;
+
+    if(mx==0.0f && my==0.0f && mz==0.0f) {
+                _2q0 = 2.0f*q0; _2q1 = 2.0f*q1; _2q2 = 2.0f*q2; _2q3 = 2.0f*q3;
+                invS = 1.0f / (ax*ax + ay*ay + az*az);
+                _4q0 = 4.0f*q0; _8q1 = 8.0f*q1; _8q2 = 8.0f*q2;
+                normS = 1.0f / sqrtf(_2q1*q1 + _2q2*q2); // Исправлено под актуальные переменные
+                // ... остальной код 6-осевого блока
+        // 6-axis mode
+        _2q0 = 2.0f*q0; _2q1 = 2.0f*q1; _2q2 = 2.0f*q2; _2q3 = 2.0f*q3;
+        float invS = 1.0f / (ax*ax + ay*ay + az*az);
+        float norm = sqrtf(ax*ax + ay*ay + az*az);
+        if(norm < 0.001f) norm = 1.0f; else norm = 1.0f/norm;
+        ax*=norm; ay*=norm; az*=norm;
+
+        float _4q0 = 4.0f*q0, _4q1 = 4.0f*q1, _4q2 = 4.0f*q2, _8q1 = 8.0f*q1, _8q2 = 8.0f*q2;
+        float normS = 1.0f / sqrtf(_4q1*q1 + _4q2*q2 - 1.0f); // Упрощённая норма для акселерометра
+
+        // Градиентный спуск (упрощённая и быстрая версия для 6-осей)
+        float v1 = 2.0f*(q1*q3 - q0*q2) - ax;
+        float v2 = 2.0f*(q0*q1 + q2*q3) - ay;
+        float v3 = 1.0f - 2.0f*(q1*q1 + q2*q2) - az;
+
+        qDot1 = beta * ( 2.0f*v1*q2 - 2.0f*v2*q1 );
+        qDot2 = beta * ( 2.0f*v1*q3 - 2.0f*v2*q0 - 4.0f*q1 + 4.0f*v3*q2 );
+        qDot3 = beta * ( 2.0f*v1*q0 - 2.0f*v2*q3 + 4.0f*q2 + 4.0f*v3*q1 );
+        qDot4 = beta * ( 2.0f*v1*q1 - 2.0f*v2*q2 );
+    } else {
+                _2q0 = 2.0f*q0; _2q1 = 2.0f*q1; _2q2 = 2.0f*q2; _2q3 = 2.0f*q3; // ← Заполняем перед использованием
+                // ... остальной код 9-осевого блока
+        // 9-axis mode (полная версия Мэджвика)
+        _2q0mx = 2.0f*q0*mx; _2q0my = 2.0f*q0*my; _2q0mz = 2.0f*q0*mz;
+        _2q1mx = 2.0f*q1*mx;
+        _2bx = sqrtf(_2q0mx*_2q0mx + _2q0my*_2q0my + _2q0mz*_2q0mz);
+        _2bz = sqrtf(_2q0mz*_2q0mz + _2q0my*_2q0my + _2q0mz*_2q0mz);        
+            //  _2bx = sqrtf(_4q0mx*_4q0mx + _2q0my*_2q0my + _2q0mz*_2q0mz);
+            //  _2bz = sqrtf(_4q0mz*_4q0mz + _2q0my*_2q0my + _2q0mz*_2q0mz);
+        
+        _4bx = 2.0f*_2bx; _4bz = 2.0f*_2bz;
+
+        float s0 = -_2q2*(2.0f*q1q3 - _2q0*q2 - ax) + _2q1*(2.0f*q0*q1 + _2q2*q3 - ay) - _2bz*q2*(_2bx*(0.5f - q2q2 - q3q3) + _2bz*(q1q3 - q0*q2) - mx) + (-_2bx*q3 + _2bz*q1)*(_2bx*(q1q2 - q0*q3) + _2bz*(q0q1 + q2q3) - my) + _2bx*q2*(_2bx*(q0q2 + q1q3) + _2bz*(0.5f - q1q1 - q2q2) - mz);
+        float s1 =  _2q3*(2.0f*q1q3 - _2q0*q2 - ax) + _2q0*(2.0f*q0*q1 + _2q2*q3 - ay) - 4.0f*q1*(1 - 2.0f*q1q1 - 2.0f*q2q2 - az) + _2bz*q3*(_2bx*(0.5f - q2q2 - q3q3) + _2bz*(q1q3 - q0*q2) - mx) + (_2bx*q2 + _2bz*q0)*(_2bx*(q1q2 - q0*q3) + _2bz*(q0q1 + q2q3) - my) + (_2bx*q3 - _4bz*q1)*(_2bx*(q0q2 + q1q3) + _2bz*(0.5f - q1q1 - q2q2) - mz);
+        float s2 = -_2q0*(2.0f*q1q3 - _2q0*q2 - ax) + _2q3*(2.0f*q0*q1 + _2q2*q3 - ay) - 4.0f*q2*(1 - 2.0f*q1q1 - 2.0f*q2q2 - az) + (-_4bx*q2 - _2bz*q0)*(_2bx*(0.5f - q2q2 - q3q3) + _2bz*(q1q3 - q0*q2) - mx) + (_2bx*q1 + _2bz*q3)*(_2bx*(q1q2 - q0*q3) + _2bz*(q0q1 + q2q3) - my) + (_2bx*q0 - _4bz*q2)*(_2bx*(q0q2 + q1q3) + _2bz*(0.5f - q1q1 - q2q2) - mz);
+        float s3 =  _2q1*(2.0f*q1q3 - _2q0*q2 - ax) + _2q2*(2.0f*q0*q1 + _2q2*q3 - ay) + (-_4bx*q3 + _2bz*q1)*(_2bx*(0.5f - q2q2 - q3q3) + _2bz*(q1q3 - q0*q2) - mx) + (-_2bx*q0 + _2bz*q2)*(_2bx*(q1q2 - q0*q3) + _2bz*(q0q1 + q2q3) - my) + _2bx*q1*(_2bx*(q0q2 + q1q3) + _2bz*(0.5f - q1q1 - q2q2) - mz);
+
+        recipNorm = 1.0f / sqrtf(s0*s0 + s1*s1 + s2*s2 + s3*s3);
+        qDot1 = beta * s0 * recipNorm; qDot2 = beta * s1 * recipNorm;
+        qDot3 = beta * s2 * recipNorm; qDot4 = beta * s3 * recipNorm;
+    }
+
+    // Интегрирование гироскопа + коррекция градиентом
+    q0 += (-q1*gx - q2*gy - q3*gz - qDot1) * dt;
+    q1 += ( q0*gx + q2*gz - q3*gy - qDot2) * dt;
+    q2 += ( q0*gy - q1*gz + q3*gx - qDot3) * dt;
+    q3 += ( q0*gz + q1*gy - q2*gx - qDot4) * dt;
+
+    float norm = sqrtf(q0*q0 + q1*q1 + q2*q2 + q3*q3);
+    if (norm > 0.0001f) { norm = 1.0f/norm; q0*=norm; q1*=norm; q2*=norm; q3*=norm; }
+}
+
+void MadgwickFilter::getQuaternion(float &w, float &x, float &y, float &z) const { w=q0; x=q1; y=q2; z=q3; }
+void MadgwickFilter::getEuler(float &roll, float &pitch, float &yaw) const {
+    roll  = atan2f(2.0f*(q0*q1 + q2*q3), 1.0f - 2.0f*(q1*q1 + q2*q2));
+          //  pitch = asinf(constrainf(2.0f*(q0*q2 - q3*q1), -1.0f, 1.0f));
+    pitch = asinf(constrain(2.0f*(q0*q2 - q3*q1), -1.0f, 1.0f));
+    yaw   = atan2f(2.0f*(q0*q3 + q1*q2), 1.0f - 2.0f*(q2*q2 + q3*q3));
+}
+void MadgwickFilter::setInitialState(float roll, float pitch, float yaw) {
+    float cr = cosf(roll*0.5f), sr = sinf(roll*0.5f);
+    float cp = cosf(pitch*0.5f), sp = sinf(pitch*0.5f);
+    float cy = cosf(yaw*0.5f), sy = sinf(yaw*0.5f);
+    q0 = cr*cp*cy + sr*sp*sy;
+    q1 = sr*cp*cy - cr*sp*sy;
+    q2 = cr*sp*cy + sr*cp*sy;
+    q3 = cr*cp*sy - sr*sp*cy;
+}
+
+
+void MadgwickFilter::setAdaptiveParams(float vibrationLevel) {
+    if (!_adaptiveEnabled) {
+        beta = _baseBeta;
+        return;
+    }
+    
+    float vib = fmaxf(0.0f, fminf(vibrationLevel, 1.0f));
+    
+    // Обратная зависимость: больше вибраций -> меньше beta
+    beta = _minBeta + (_maxBeta - _minBeta) * (1.0f - vib);
+}
+
+=== Файл: ./modules//filter_manager//MahonyFilter.cpp ===
+
+
+// MahonyFilter.cpp 
+// cpp
+
+#include "MahonyFilter.h"
+#include <math.h>
+#pragma GCC optimize("O3") // Включение агрессивной оптимизации + FPU
+
+MahonyFilter::MahonyFilter() : q0(1.0f), q1(0.0f), q2(0.0f), q3(0.0f),
+                               twoKp(1.0f), twoKi(0.001f),
+                               exInt(0.0f), eyInt(0.0f), ezInt(0.0f) {}
+
+void MahonyFilter::begin(float sampleFreqHz) {
+    twoKp = 1.0f * 2.0f; twoKi = 0.001f * 2.0f;
+    q0 = 1.0f; q1 = q2 = q3 = 0.0f;
+    exInt = eyInt = ezInt = 0.0f;
+}
+
+void MahonyFilter::setGains(float kp, float ki) {
+    twoKp = kp * 2.0f; twoKi = ki * 2.0f;
+}
+
+void MahonyFilter::update(float dt, float ax, float ay, float az, float gx, float gy, float gz, float mx, float my, float mz) {
+    float norm, vx, vy, vz, ex, ey, ez;
+
+    norm = sqrtf(ax*ax + ay*ay + az*az);
+    if (norm < 0.001f) return;
+    norm = 1.0f / norm;
+    ax *= norm; ay *= norm; az *= norm;
+
+    vx = 2.0f*(q1*q3 - q0*q2); vy = 2.0f*(q0*q1 + q2*q3); vz = q0*q0 - q1*q1 - q2*q2 + q3*q3;
+
+    ex = ay*vz - az*vy; ey = az*vx - ax*vz; ez = ax*vy - ay*vx;
+
+    if(twoKi > 0.0f) {
+        exInt += ex*dt; eyInt += ey*dt; ezInt += ez*dt;
+        gx += twoKi*exInt; gy += twoKi*eyInt; gz += twoKi*ezInt;
+    }
+
+    gx += twoKp*ex; gy += twoKp*ey; gz += twoKp*ez;
+
+    float qa=q0, qb=q1, qc=q2, qd=q3;
+    gx *= 0.5f*dt; gy *= 0.5f*dt; gz *= 0.5f*dt;
+    q0 += -qb*gx - qc*gy - qd*gz;
+    q1 +=  qa*gx + qc*gz - qd*gy;
+    q2 +=  qa*gy - qb*gz + qd*gx;
+    q3 +=  qa*gz + qb*gy - qc*gx;
+
+    norm = sqrtf(q0*q0 + q1*q1 + q2*q2 + q3*q3);
+    if (norm > 0.0001f) { norm = 1.0f/norm; q0*=norm; q1*=norm; q2*=norm; q3*=norm; }
+}
+
+void MahonyFilter::getQuaternion(float &w, float &x, float &y, float &z) const { w=q0; x=q1; y=q2; z=q3; }
+void MahonyFilter::getEuler(float &roll, float &pitch, float &yaw) const {
+    roll  = atan2f(2.0f*(q0*q1 + q2*q3), 1.0f - 2.0f*(q1*q1 + q2*q2));
+    // pitch = asinf(constrainf(2.0f*(q0*q2 - q3*q1), -1.0f, 1.0f));
+    pitch = asinf(constrain(2.0f*(q0*q2 - q3*q1), -1.0f, 1.0f));
+    yaw   = atan2f(2.0f*(q0*q3 + q1*q2), 1.0f - 2.0f*(q2*q2 + q3*q3));
+}
+void MahonyFilter::setInitialState(float roll, float pitch, float yaw) {
+    float cr = cosf(roll*0.5f), sr = sinf(roll*0.5f);
+    float cp = cosf(pitch*0.5f), sp = sinf(pitch*0.5f);
+    float cy = cosf(yaw*0.5f), sy = sinf(yaw*0.5f);
+    q0 = cr*cp*cy + sr*sp*sy;
+    q1 = sr*cp*cy - cr*sp*sy;
+    q2 = cr*sp*cy + sr*cp*sy;
+    q3 = cr*cp*sy - sr*sp*cy;
+    exInt = eyInt = ezInt = 0.0f;
+}
+
+
+void MahonyFilter::setAdaptiveParams(float vibrationLevel) {
+    if (!_adaptiveEnabled) {
+        twoKp = _baseKp * 2.0f; 
+        twoKi = _baseKi * 2.0f;
+        return;
+    }
+    
+    // Ограничиваем уровень вибраций [0.0 ... 1.0]
+    float vib = fmaxf(0.0f, fminf(vibrationLevel, 1.0f));
+    
+    // Обратная зависимость: больше вибраций -> меньше Kp/Ki
+    // Lerp: val = min + (max - min) * (1.0 - vib)
+    float kp = _minKp + (_maxKp - _minKp) * (1.0f - vib);
+    float ki = _minKi + (_maxKi - _minKi) * (1.0f - vib);
+    
+    twoKp = kp * 2.0f;
+    twoKi = ki * 2.0f;
+}
+
+📁 ПАПКА: modules//flight_stabilizer/
+
+=== Файл: ./modules//flight_stabilizer//FlightStabilizer.h ===
+
+
+/**
+ * @file flight_stabilizer.h
+ * @brief Система ПИД-стабилизации полёта БПЛА
+ * @version 2.0.0 (ESP32-S3 адаптация)
+ * @details
+ * - Фиксированный шаг дискретизации 250 Гц (4000 мкс)
+ * - Выполнение на ядре 1 для разгрузки ядра 0 (LoRa/I2C/UART)
+ * - Адаптивные ПИД-коэффициенты на основе оценки вибраций
+ * - Полная документация и отладка через ESP_LOG
+ */
+#pragma once
+#ifndef FLIGHT_STABILIZER_H
+#define FLIGHT_STABILIZER_H
+
+#include <Arduino.h>
+#include <esp_log.h>
+#include <freertos/FreeRTOS.h>
+#include <freertos/task.h>
+
+// Локальные заголовки проекта
+#include "common/types.h"
+#include "config/pins.h"
+#include "modules/imu_handler/mpu9250_handler.h"
+#include "modules/pca9685_servo/pca9685_servo.h"
+
+/**
+ * @brief Конфигурация ПИД-регулятора с адаптивными параметрами
+ */
+struct PIDConfig {
+    float kp = 2.0f;              ///< Пропорциональный коэффициент
+    float ki = 0.0f;              ///< Интегральный коэффициент
+    float kd = 0.5f;              ///< Дифференциальный коэффициент
+    float maxIntegral = 10.0f;    ///< Ограничение интеграла (anti-windup)
+    float maxOutput = 30.0f;      ///< Макс. выход (градусы)
+    float dFilterAlpha = 0.2f;    ///< Коэф. фильтра производной (0.0-1.0)
+
+    // 🔑 Адаптивные параметры (заполняются автоматически)
+    float baseKp = 2.0f;          ///< Базовое Kp для восстановления
+    float baseKi = 0.0f;          ///< Базовое Ki
+    float baseKd = 0.5f;          ///< Базовое Kd
+};
+
+/**
+ * @brief Состояние ПИД-регулятора
+ */
+struct PIDState {
+    float error = 0.0f;
+    float integral = 0.0f;
+    float derivative = 0.0f;
+    float lastError = 0.0f;
+    float output = 0.0f;
+};
+
+/**
+ * @brief Режимы стабилизации
+ */
+enum class StabilizationMode : uint8_t {
+    MANUAL      = 0,    ///< Ручное управление (без стабилизации)
+    ROLL_PITCH  = 1,    ///< Автогоризонт (крен + тангаж)
+    FULL        = 2,    ///< Полная стабилизация (вкл. рыскание)
+    HOVER       = 3     ///< Удержание позиции (требует GPS/барометр)
+};
+
+/**
+ * @class FlightStabilizer
+ * @brief Основной класс системы стабилизации полёта
+ *
+ * @note Архитектура:
+ * - Все вычисления выполняются на ядре 1 (ESP32-S3)
+ * - Фиксированный шаг 250 Гц устраняет джиттер ПИД
+ * - Адаптивность снижает Kp/Kd при вибрациях для стабильности
+ */
+class FlightStabilizer {
+public:
+    FlightStabilizer();
+    ~FlightStabilizer();
+
+    /**
+     * @brief Инициализация системы
+     * @param imuHandler Указатель на обработчик IMU
+     * @param servoController Указатель на контроллер серво
+     * @return true при успехе
+     */
+    bool begin(MPU9250Handler* imuHandler, PCA9685ServoController* servoController);
+
+    /**
+     * @brief Запуск задачи стабилизации на ядре 1
+     * @note Вызывать после begin() в setup()
+     */
+    void startStabilizationTask();
+
+    /**
+     * @brief Основной метод обновления (вызывается из задачи)
+     * @param comUp Команда тангажа 0-255
+     * @param comLeft Команда крена 0-255
+     * @return true если стабилизация активна
+     */
+    bool update(float comUp, float comLeft);
+
+    // Управление
+    void enable();
+    void disable();
+    void setMode(StabilizationMode mode);
+    StabilizationMode getMode() const { return _mode; }
+    bool isEnabled() const { return _enabled; }
+
+    // Адаптивность
+    void setAdaptivePID(bool enable) { _adaptiveEnabled = enable; }
+    bool isAdaptivePIDEnabled() const { return _adaptiveEnabled; }
+    void updateAdaptiveParams(float vibrationLevel);
+
+    // Диагностика
+    void printStatus() const;
+    bool isStable() const;
+    void resetPIDStates();
+
+    // Геттеры конфигурации (для тюнинга)
+    PIDConfig getRollPID() const { return _rollPID; }
+    PIDConfig getPitchPID() const { return _pitchPID; }
+    PIDConfig getYawPID() const { return _yawPID; }
+
+    // 🔧 Статический метод для преобразования режима в строку
+    static const char* modeToString(StabilizationMode mode);
+
+private:
+    // Указатели на внешние объекты
+    MPU9250Handler* _imuHandler = nullptr;
+    PCA9685ServoController* _servoController = nullptr;
+
+    // Флаги состояния
+    bool _initialized = false;
+    bool _enabled = false;
+    bool _adaptiveEnabled = false;
+    StabilizationMode _mode = StabilizationMode::MANUAL;
+
+    // Временные параметры
+    float _dt = 0.004f;  // Фиксированный шаг: 4000 мкс = 250 Гц
+    uint32_t _lastUpdateMicros = 0;
+
+    // Целевые углы (из команд пульта)
+    float _targetRoll = 0.0f;
+    float _targetPitch = 0.0f;
+    float _targetYaw = 0.0f;
+
+    // ПИД-конфигурации и состояния по осям
+    PIDConfig _rollPID, _pitchPID, _yawPID;
+    PIDState _rollState, _pitchState, _yawState;
+
+    // 🔑 Фильтр производной (отдельно по осям)
+    float _prevDerivative[3] = {0.0f, 0.0f, 0.0f};  // Roll, Pitch, Yaw
+
+    // Базовые коэффициенты для адаптивности
+    PIDConfig _baseRollPID, _basePitchPID;
+
+    // Статистика
+    struct {
+        uint32_t stabilizations = 0;
+        uint32_t corrections = 0;
+        uint32_t saturationEvents = 0;
+        uint32_t invalidDataEvents = 0;
+    } _stats;
+
+    // 🔧 Приватные методы
+    float calculatePID(PIDState& state, const PIDConfig& config,
+                      float error, int axisIndex);
+    void applyRollCorrection(float correction);
+    void applyPitchCorrection(float correction);
+    void applyYawCorrection(float correction);
+    void validateAngles(float& roll, float& pitch, float& yaw);
+
+    // 🔧 Задача FreeRTOS для ядра 1
+    static void stabilizationTask(void* parameter);
+    TaskHandle_t _taskHandle = nullptr;
+
+    // Тег для ESP_LOG
+    static const char* TAG;
+};
+
+#endif // FLIGHT_STABILIZER_H
+
+=== Файл: ./modules//flight_stabilizer//flight_stabilizer.cpp ===
+
+
+/**
+ * @file flight_stabilizer.cpp
+ * @brief Реализация ПИД-стабилизации с адаптивными параметрами
+ * @version 2.0.0 (ESP32-S3 адаптация)
+ */
+#include "modules/flight_stabilizer/FlightStabilizer.h"
+// #include "modules/flight_stabilizer/FlightStabilizer.h"
+#include <math.h>
+
+// Тег для логирования
+const char* FlightStabilizer::TAG = "FLIGHT_STAB";
+
+FlightStabilizer::FlightStabilizer() {
+    // Инициализация ПИД по умолчанию (значения требуют тюнинга!)
+    _rollPID = {2.0f, 0.0f, 0.5f, 10.0f, 30.0f, 0.2f};
+    _pitchPID = {2.0f, 0.0f, 0.5f, 10.0f, 30.0f, 0.2f};
+    _yawPID = {1.5f, 0.0f, 0.3f, 10.0f, 45.0f, 0.2f};
+
+    // Сохраняем базовые значения для адаптивности
+    _baseRollPID = _rollPID;
+    _basePitchPID = _pitchPID;
+
+    resetPIDStates();
+
+    ESP_LOGI(TAG, "✅ FlightStabilizer: конструктор завершён");
+    ESP_LOGD(TAG, "   Roll PID: Kp=%.2f Ki=%.2f Kd=%.2f",
+             _rollPID.kp, _rollPID.ki, _rollPID.kd);
+}
+
+FlightStabilizer::~FlightStabilizer() {
+    if (_taskHandle) {
+        vTaskDelete(_taskHandle);
+        _taskHandle = nullptr;
+    }
+    ESP_LOGI(TAG, "🔄 Ресурсы FlightStabilizer освобождены");
+}
+
+bool FlightStabilizer::begin(MPU9250Handler* imuHandler,
+                            PCA9685ServoController* servoController) {
+    ESP_LOGI(TAG, "=== 🚀 Инициализация FlightStabilizer ===");
+
+    // 🔑 Проверка указателей
+    if (!imuHandler || !servoController) {
+        ESP_LOGE(TAG, "❌ Null pointer в begin(): imu=%p servo=%p",
+                 imuHandler, servoController);
+        return false;
+    }
+
+    _imuHandler = imuHandler;
+    _servoController = servoController;
+
+    // Проверка инициализации IMU
+    if (!_imuHandler->isInitialized()) {
+        ESP_LOGW(TAG, "⚠️ IMU не инициализирован — калибровка в процессе");
+    }
+
+    _initialized = true;
+    _enabled = false;  // По умолчанию выключено
+    _lastUpdateMicros = micros();
+
+    ESP_LOGI(TAG, "✅ FlightStabilizer готов | Режим: %s",
+             modeToString(_mode));
+    return true;
+}
+
+/**
+ * @brief Задача стабилизации на ядре 1 (ESP32-S3)
+ * @details Выполняет update() с фиксированным шагом 250 Гц
+ */
+void FlightStabilizer::stabilizationTask(void* parameter) {
+    FlightStabilizer* self = static_cast<FlightStabilizer*>(parameter);
+
+    // Локальные переменные для команд (обновляются из основного loop)
+    float comUp = 127.0f, comLeft = 127.0f;
+
+    while (true) {
+        if (self->_enabled && self->_initialized) {
+            // 🔑 Фиксированный шаг: блокируем до следующего тика
+            uint32_t now = micros();
+            int32_t elapsed = now - self->_lastUpdateMicros;
+
+            if (elapsed >= 4000) {  // 4000 мкс = 250 Гц
+                self->_dt = 0.004f;
+                self->_lastUpdateMicros = now;
+
+                // 🔧 Получаем актуальные команды (через атомарные переменные или очередь)
+                // В реальном проекте: xQueueReceive() из основного loop
+                self->update(comUp, comLeft);
+            }
+        }
+
+        // 🔑 Отдаём управление планировщику (минимальная задержка)
+        vTaskDelay(1 / portTICK_PERIOD_MS);
+    }
+}
+
+void FlightStabilizer::startStabilizationTask() {
+    if (!_initialized) {
+        ESP_LOGE(TAG, "❌ Нельзя запустить задачу: не инициализирован");
+        return;
+    }
+
+    ESP_LOGI(TAG, "🚀 Создание задачи стабилизации на CORE 1...");
+
+    xTaskCreatePinnedToCore(
+        stabilizationTask,    // Функция задачи
+        "StabilizerTask",     // Имя
+        8192,                 // Стек (8 KB для ESP_LOG внутри)
+        this,                 // Параметр (this)
+        2,                    // Приоритет (выше loop())
+        &_taskHandle,         // Хендл
+        1                     // 🔑 Ядро 1
+    );
+
+    if (_taskHandle) {
+        ESP_LOGI(TAG, "✅ Задача запущена | Heap: %u B", ESP.getFreeHeap());
+    } else {
+        ESP_LOGE(TAG, "❌ Ошибка создания задачи!");
+    }
+}
+
+/**
+ * @brief Основной метод обновления ПИД-логики
+ * @note Вызывается из задачи стабилизации с фиксированным шагом
+ */
+bool FlightStabilizer::update(float comUp, float comLeft) {
+    // 🔑 Быстрые проверки
+    if (!_enabled || !_initialized || !_imuHandler || !_servoController) {
+        return false;
+    }
+
+    // 🔑 Проверка валидности данных IMU
+    if (!_imuHandler->isDataValid()) {
+        _stats.invalidDataEvents++;
+        if (_stats.invalidDataEvents % 100 == 0) {
+            ESP_LOGW(TAG, "⚠️ Данные IMU недоступны (событий: %lu)",
+                     _stats.invalidDataEvents);
+        }
+        return false;
+    }
+
+    // 🔹 Получение текущих углов
+    const SensorData& imu = _imuHandler->getData();
+    float currentRoll = imu.roll;
+    float currentPitch = imu.pitch;
+    float currentYaw = imu.yaw;
+
+    // 🔹 Валидация углов (защита от выбросов)
+    validateAngles(currentRoll, currentPitch, currentYaw);
+
+    // 🔹 Преобразование команд пульта в целевые углы (-45°...+45°)
+    _targetPitch = map(comUp, 0, 255, -45.0f, 45.0f);
+    _targetRoll = map(comLeft, 0, 255, -45.0f, 45.0f);
+
+    // 🔹 Расчёт ПИД в зависимости от режима
+    switch (_mode) {
+        case StabilizationMode::ROLL_PITCH:
+            // Крен
+            float rollError = currentRoll - _targetRoll;
+            float rollCorrection = calculatePID(_rollState, _rollPID, rollError, 0);
+            applyRollCorrection(rollCorrection);
+
+            // Тангаж
+            float pitchError = currentPitch - _targetPitch;
+            float pitchCorrection = calculatePID(_pitchState, _pitchPID, pitchError, 1);
+            applyPitchCorrection(pitchCorrection);
+
+            _stats.corrections += 2;
+            break;
+
+        case StabilizationMode::FULL:
+            // Крен + Тангаж (как выше) + Рыскание
+            float yawError = currentYaw - _targetYaw;
+            float yawCorrection = calculatePID(_yawState, _yawPID, yawError, 2);
+            applyYawCorrection(yawCorrection);
+
+            _stats.corrections += 3;
+            break;
+
+        case StabilizationMode::MANUAL:
+        default:
+            return false;  // Ручной режим — без стабилизации
+    }
+
+    _stats.stabilizations++;
+
+    // 🔹 Периодическая отладка (каждые 50 итераций)
+    if (_stats.stabilizations % 50 == 0 && ESP_LOG_LEVEL >= ESP_LOG_DEBUG) {
+        ESP_LOGD(TAG, "STAB| R:%+5.1f°→%+5.1f°| P:%+5.1f°→%+5.1f°| Y:%5.1f°→%5.1f°",
+                 currentRoll, _targetRoll, currentPitch, _targetPitch,
+                 currentYaw, _targetYaw);
+    }
+
+    return true;
+}
+
+/**
+ * @brief Расчёт ПИД-регулятора с фильтром производной и Anti-Windup
+ * @param axisIndex 0=Roll, 1=Pitch, 2=Yaw (для отладки и адаптивности)
+ */
+float FlightStabilizer::calculatePID(PIDState& state, const PIDConfig& config,
+                                    float error, int axisIndex) {
+    // 🔹 Пропорциональная составляющая
+    float P = config.kp * error;
+
+    // 🔹 Интегральная составляющая с Anti-Windup
+    bool outputSaturated = false;
+    float tempOutput = P + config.ki * state.integral +
+                      config.kd * _prevDerivative[axisIndex];
+
+    if (fabsf(tempOutput) >= config.maxOutput) {
+        outputSaturated = true;
+    }
+
+    // Интегрируем ТОЛЬКО если выход не насыщен
+    if (!outputSaturated) {
+        state.integral += error * _dt;
+    }
+    state.integral = constrain(state.integral, -config.maxIntegral, config.maxIntegral);
+    float I = config.ki * state.integral;
+
+    // 🔹 Дифференциальная составляющая с НЧ-фильтром
+    float D_raw = (error - state.lastError) / _dt;
+    float D = config.kd * (
+        config.dFilterAlpha * D_raw +
+        (1.0f - config.dFilterAlpha) * _prevDerivative[axisIndex]
+    );
+    _prevDerivative[axisIndex] = D_raw;  // Сохраняем для следующего шага
+
+    state.lastError = error;
+
+    // 🔹 Формирование выхода
+    float output = P + I + D;
+    output = constrain(output, -config.maxOutput, config.maxOutput);
+
+    // 🔹 Отладка компонентов ПИД (только при DEBUG_VERBOSE)
+    #if CONFIG_LOG_DEFAULT_LEVEL_DEBUG
+    if (ESP_LOG_LEVEL >= ESP_LOG_VERBOSE) {
+        const char* axisName = (axisIndex == 0) ? "ROLL" :
+                              (axisIndex == 1) ? "PITCH" : "YAW";
+        ESP_LOGV(TAG, "[%s] P=%.2f I=%.2f D=%.2f | OUT=%.2f",
+                 axisName, P, I, D, output);
+    }
+    #endif
+
+    return output;
+}
+
+/**
+ * @brief Применение коррекции крена (дифференциальное управление элеронами)
+ */
+void FlightStabilizer::applyRollCorrection(float correction) {
+    float leftAileron = _targetRoll - correction;
+    float rightAileron = _targetRoll + correction;
+
+    // Ограничение диапазона серво
+    leftAileron = constrain(leftAileron, -45.0f, 45.0f);
+    rightAileron = constrain(rightAileron, -45.0f, 45.0f);
+
+    // Установка углов (каналы 0 и 1 для элеронов)
+    _servoController->setLogicalAngle(0, static_cast<int16_t>(leftAileron));
+    _servoController->setLogicalAngle(1, static_cast<int16_t>(rightAileron));
+}
+
+/**
+ * @brief Применение коррекции тангажа (синхронное управление рулями высоты)
+ */
+void FlightStabilizer::applyPitchCorrection(float correction) {
+    float elevatorAngle = _targetPitch + correction;
+    elevatorAngle = constrain(elevatorAngle, -45.0f, 45.0f);
+
+    // Каналы 2 и 3 для рулей высоты
+    _servoController->setLogicalAngle(2, static_cast<int16_t>(elevatorAngle));
+    _servoController->setLogicalAngle(3, static_cast<int16_t>(elevatorAngle));
+}
+
+/**
+ * @brief Применение коррекции рыскания (руль направления)
+ */
+void FlightStabilizer::applyYawCorrection(float correction) {
+    float rudderAngle = _targetYaw + correction;
+    rudderAngle = constrain(rudderAngle, -45.0f, 45.0f);
+
+    // Канал 4 для руля направления
+    _servoController->setLogicalAngle(4, static_cast<int16_t>(rudderAngle));
+}
+
+/**
+ * @brief Адаптивное обновление ПИД-коэффициентов на основе вибраций
+ * @param vibrationLevel Уровень вибраций [0.0...1.0] от VibrationEstimator
+ */
+void FlightStabilizer::updateAdaptiveParams(float vibrationLevel) {
+    if (!_adaptiveEnabled) {
+        // Восстанавливаем базовые значения
+        _rollPID = _baseRollPID;
+        _pitchPID = _basePitchPID;
+        return;
+    }
+
+    // Нормализация [0.0...1.0]
+    float vib = constrain(vibrationLevel, 0.0f, 1.0f);
+
+    // 🔹 Алгоритм адаптивности:
+    // Чем выше вибрация → тем МЕНЬШЕ Kp (меньше реакция на шум)
+    // и МЕНЬШЕ Kd (производная усиливает высокочастотный шум)
+    // Ki меняем минимально для сохранения удержания позиции
+
+    float factor = 1.0f - (vib * 0.7f);  // При max вибрации оставляем 30% мощности
+
+    _rollPID.kp = _baseRollPID.kp * factor;
+    _rollPID.kd = _baseRollPID.kd * factor * 0.5f;  // Kd снижаем агрессивнее
+    _rollPID.ki = _baseRollPID.ki * (1.0f - vib * 0.3f);  // Ki почти не меняем
+
+    _pitchPID.kp = _basePitchPID.kp * factor;
+    _pitchPID.kd = _basePitchPID.kd * factor * 0.5f;
+    _pitchPID.ki = _basePitchPID.ki * (1.0f - vib * 0.3f);
+
+    // 🔹 Отладка адаптивности
+    #if CONFIG_LOG_DEFAULT_LEVEL_DEBUG
+    if (ESP_LOG_LEVEL >= ESP_LOG_DEBUG && _stats.stabilizations % 100 == 0) {
+        ESP_LOGD(TAG, "ADAPT| Vib=%.2f | Roll Kp=%.2f→%.2f Kd=%.2f→%.2f",
+                 vib, _baseRollPID.kp, _rollPID.kp,
+                 _baseRollPID.kd, _rollPID.kd);
+    }
+    #endif
+}
+
+//   ===*********************************************************
+// 🔧 Остальные методы (validateAngles, printStatus, isStable, resetPIDStates, modeToString)
+// реализуются аналогично исходному коду с добавлением ESP_LOG
+
+
+/**
+* @brief Валидация углов от IMU
+*
+* @param roll Крен (градусы) - передаётся по ссылке
+* @param pitch Тангаж (градусы) - передаётся по ссылке
+* @param yaw Рыскание (градусы) - передаётся по ссылке
+*
+* @note Защита от аномальных значений датчика
+*/
+void FlightStabilizer::validateAngles(float& roll, float& pitch, float& yaw) {
+    // Проверка крена
+    if (isnan(roll) || isinf(roll) || abs(roll) > 120.0f) {
+        roll = 0.0f;
+        ESP_LOGW(TAG_FLIGHT, "⚠️ Аномальный крен: сброшено в 0°");
+    }
+
+    // Проверка тангажа
+    if (isnan(pitch) || isinf(pitch) || abs(pitch) > 120.0f) {
+        pitch = 0.0f;
+        ESP_LOGW(TAG_FLIGHT, "⚠️ Аномальный тангаж: сброшено в 0°");
+    }
+
+    // Проверка рыскания
+    if (isnan(yaw) || isinf(yaw) || yaw < 0.0f || yaw > 360.0f) {
+        yaw = 0.0f;
+        ESP_LOGW(TAG_FLIGHT, "⚠️ Аномальное рыскание: сброшено в 0°");
+    }
+}
+
+// ============================================================================
+// ДИАГНОСТИКА
+// ============================================================================
+
+/**
+* @brief Вывод статуса системы в лог
+*/
+void FlightStabilizer::printStatus() const {
+    ESP_LOGI(TAG_FLIGHT, "=== СТАТУС СИСТЕМЫ СТАБИЛИЗАЦИИ ===");
+    ESP_LOGI(TAG_FLIGHT, "Режим: %s", modeToString(_mode));
+    ESP_LOGI(TAG_FLIGHT, "Состояние: %s", _enabled ? "ВКЛЮЧЕНА" : "ВЫКЛЮЧЕНА");
+    ESP_LOGI(TAG_FLIGHT, "Инициализирована: %s", _initialized ? "ДА" : "НЕТ");
+
+    if (imuHandler && !imuHandler->isDataValid()) {
+        ESP_LOGW(TAG_FLIGHT, "⚠️ Данные гироскопа недоступны");
+    }
+
+    ESP_LOGI(TAG_FLIGHT, "Статистика:");
+    ESP_LOGI(TAG_FLIGHT, "  Обновлений: %lu", _stats.stabilizations);
+    ESP_LOGI(TAG_FLIGHT, "  Коррекций: %lu", _stats.corrections);
+    ESP_LOGI(TAG_FLIGHT, "  Насыщений: %lu", _stats.saturationEvents);
+    ESP_LOGI(TAG_FLIGHT, "  Ошибок данных: %lu", _stats.invalidDataEvents);
+    ESP_LOGI(TAG_FLIGHT, "===================================");
+}
+
+/**
+* @brief Преобразование режима стабилизации в строку
+* @param mode Режим для преобразования
+* @return Строковое описание режима
+*/
+const char* FlightStabilizer::modeToString(StabilizationMode mode) const {
+    switch (mode) {
+        case StabilizationMode::MANUAL:      return "MANUAL (ручной)";
+        case StabilizationMode::ROLL_PITCH:  return "ROLL_PITCH (автогоризонт)";
+        case StabilizationMode::FULL:        return "FULL (полная)";
+        case StabilizationMode::HOVER:       return "HOVER (удержание)";
+        default:                             return "UNKNOWN";
+    }
+}
+
+/**
+* @brief Проверка стабильности положения
+* @return true если положение стабильно
+*
+* @note Стабильным считается положение с малыми углами и угловыми скоростями
+*/
+bool FlightStabilizer::isStable() const {
+    if (!imuHandler || !imuHandler->isDataValid()) {
+        return false;
+    }
+
+    const SensorData& data = imuHandler->getData();
+
+    // Проверка углов и угловых скоростей
+    bool anglesStable = (abs(data.roll) < 5.0f && abs(data.pitch) < 5.0f);
+    bool ratesStable = (abs(data.gyro.x) < 0.17f && abs(data.gyro.y) < 0.17f); // ~10°/с в рад/с
+
+    return anglesStable && ratesStable;
+}
+
+
+// Реализация адаптивности
+void FlightStabilizer::updateAdaptiveParams(float vibrationLevel) {
+    if (!_adaptivePIDEnabled) {
+        // Если адаптивность выключена — возвращаем базовые
+        _rollPID = _baseRollPID;
+        _pitchPID = _basePitchPID;
+        return;
+    }
+
+    // Нормализуем вибрацию [0.0 ... 1.0]
+    float vib = constrain(vibrationLevel, 0.0f, 1.0f);
+
+    // 📐 АЛГОРИТМ:
+    // Чем выше вибрация, тем МЕНЬШЕ Kp (чтобы сервы не дергались от шума)
+    // и МЕНЬШЕ Kd (производная усиливает высокочастотный шум).
+    // Ki оставляем почти без изменений для удержания позиции.
+
+    // Формула: New = Base * (1.0 - vib * dampingFactor)
+    // dampingFactor = 0.7 (при макс вибрации оставляем 30% мощности)
+
+    float factor = 1.0f - (vib * 0.7f);
+
+    _rollPID.kp = _baseRollPID.kp * factor;
+    _rollPID.kd = _baseRollPID.kd * factor * 0.5f; // Kd снижаем агрессивнее
+
+    _pitchPID.kp = _basePitchPID.kp * factor;
+    _pitchPID.kd = _basePitchPID.kd * factor * 0.5f;
+
+    // Ki (интегратор) снижаем незначительно, чтобы не потерять ориентацию
+    _rollPID.ki = _baseRollPID.ki * (1.0f - vib * 0.3f);
+    _pitchPID.ki = _basePitchPID.ki * (1.0f - vib * 0.3f);
+}
+
+// #endif // FLIGHT_STABILIZER_H
+
+📁 ПАПКА: modules//i2c_master/
+
+=== Файл: ./modules//i2c_master//i2c_master.h ===
+/**
+ * @file i2c_master.h
+ * @brief Нативный контроллер I2C шины для ESP32-S3 (ESP-IDF 5.0+)
+ * @details
+ * - Полная замена Wire.h для максимальной производительности и надёжности
+ * - Поддержка аппаратного Flow Control и таймаутов
+ * - Интеграция с ESP_LOG для отладки
+ *
+ * @environment ESP32-S3-N16R8 | PlatformIO | ESP-IDF 5.0+
+ * @version 1.0 (миграция из Arduino IDE)
+ * @date 2026-05-26
+ */
+
+#pragma once
+
+#include <driver/i2c.h>
+#include <esp_log.h>
+#include <esp_err.h>
+#include <cstdint>
+
+#include "../../config/pins.h"
+
+// ============================================================================
+// Конфигурация I2C
+// ============================================================================
+#define I2C_MASTER_NUM          I2C_NUM_0           ///< Порт I2C (0 или 1)
+#define I2C_MASTER_FREQ_HZ      400000              ///< Частота шины: 400 кГц (Fast Mode)
+#define I2C_MASTER_TX_BUF_LEN   0                   ///< Буфер передачи: отключён
+#define I2C_MASTER_RX_BUF_LEN   0                   ///< Буфер приёма: отключён
+#define I2C_MASTER_TIMEOUT_MS   1000                ///< Таймаут операций (мс)
+
+// ============================================================================
+// Класс нативного I2C контроллера
+// ============================================================================
+class I2CMasterController {
+public:
+    /**
+     * @brief Инициализация I2C шины
+     * @return true при успешной инициализации
+     * @details
+     * - Настраивает пины SDA/SCL из Config::Pins
+     * - Включает pull-up резисторы
+     * - Устанавливает частоту 400 кГц
+     */
+    bool begin();
+
+    /**
+     * @brief Сканирование устройств на шине I2C
+     * @details Выводит список всех обнаруженных устройств через ESP_LOG
+     */
+    void scanDevices();
+
+    /**
+     * @brief Проверка подключения устройства по адресу
+     * @param address 7-bit I2C адрес устройства
+     * @return true если устройство отвечает
+     */
+    bool isDeviceConnected(uint8_t address);
+
+    /**
+     * @brief Чтение данных из регистра устройства
+     * @param dev_addr Адрес устройства (7-bit)
+     * @param reg_addr Адрес регистра внутри устройства
+     * @param data Буфер для чтения данных
+     * @param len Количество байт для чтения
+     * @return true при успехе
+     */
+    bool readRegister(uint8_t dev_addr, uint8_t reg_addr, uint8_t* data, size_t len);
+
+    /**
+     * @brief Запись данных в регистр устройства
+     * @param dev_addr Адрес устройства (7-bit)
+     * @param reg_addr Адрес регистра внутри устройства
+     * @param data Буфер с данными для записи
+     * @param len Количество байт для записи
+     * @return true при успехе
+     */
+    bool writeRegister(uint8_t dev_addr, uint8_t reg_addr, const uint8_t* data, size_t len);
+
+    /**
+     * @brief Универсальная передача данных (burst read/write)
+     * @param dev_addr Адрес устройства
+     * @param write_buffer Буфер для записи (может быть nullptr)
+     * @param write_size Размер буфера записи
+     * @param read_buffer Буфер для чтения (может быть nullptr)
+     * @param read_size Размер буфера чтения
+     * @return true при успехе
+     */
+    bool transfer(uint8_t dev_addr,
+                  const uint8_t* write_buffer, size_t write_size,
+                  uint8_t* read_buffer, size_t read_size);
+
+    /**
+     * @brief Проверка успешности инициализации
+     * @return true если begin() был успешно выполнен
+     */
+    bool isInitialized() const { return _initialized; }
+
+private:
+    static const char* TAG;          ///< Тег для ESP_LOG
+    bool _initialized = false;       ///< Флаг инициализации
+
+    /**
+     * @brief Внутренняя функция выполнения I2C команды с таймаутом
+     * @param cmd_handle Обработчик команды I2C
+     * @return esp_err_t результат выполнения
+     */
+    esp_err_t _i2c_master_cmd_begin(i2c_cmd_handle_t cmd_handle);
+};
+
+=== Файл: ./modules//i2c_master//i2c_master.cpp ===
+/**
+ * @file i2c_master.cpp
+ * @brief Реализация нативного I2C контроллера для ESP32-S3
+ * @details
+ * - Использует driver/i2c.h из ESP-IDF 5.0+
+ * - Все операции с подробной отладкой через ESP_LOG
+ * - Потокобезопасность через мьютексы (при необходимости)
+ *
+ * @version 1.0 (миграция из Arduino IDE)
+ * @date 2026-05-26
+ */
+
+#include "i2c_master.h"
+#include <cstring>  // для memset
+
+// ============================================================================
+// Статический тег для отладки
+// ============================================================================
+const char* I2CMasterController::TAG = "I2C_MASTER";
+
+// ============================================================================
+// Реализация публичного API
+// ============================================================================
+
+bool I2CMasterController::begin() {
+    ESP_LOGI(TAG, "=== 🚀 ИНИЦИАЛИЗАЦИЯ НАТИВНОГО I2C MASTER (ESP-IDF 5.0+) ===");
+    ESP_LOGI(TAG, "Параметры: SDA=GPIO%d, SCL=GPIO%d, частота=%d Гц, порт=%d",
+             Config::Pins::I2C_SDA, Config::Pins::I2C_SCL,
+             I2C_MASTER_FREQ_HZ, I2C_MASTER_NUM);
+
+    // Конфигурация I2C
+    i2c_config_t conf = {};
+    conf.mode = I2C_MODE_MASTER;
+    conf.sda_io_num = static_cast<gpio_num_t>(Config::Pins::I2C_SDA);
+    conf.sda_pullup_en = GPIO_PULLUP_ENABLE;
+    conf.scl_io_num = static_cast<gpio_num_t>(Config::Pins::I2C_SCL);
+    conf.scl_pullup_en = GPIO_PULLUP_ENABLE;
+    conf.master.clk_speed = I2C_MASTER_FREQ_HZ;
+
+    // 🔑 Критично для ESP32-S3: авто-выбор источника тактирования
+    conf.clk_flags = 0;  // I2C_SCLK_SRC_FLAG_* = 0 → авто-выбор
+
+    // Применение конфигурации
+    esp_err_t err = i2c_param_config(I2C_MASTER_NUM, &conf);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "❌ Ошибка конфигурации I2C: %s", esp_err_to_name(err));
+        return false;
+    }
+
+    // Установка драйвера
+    err = i2c_driver_install(I2C_MASTER_NUM, conf.mode,
+                            I2C_MASTER_RX_BUF_LEN,
+                            I2C_MASTER_TX_BUF_LEN, 0);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "❌ Ошибка установки драйвера I2C: %s", esp_err_to_name(err));
+        return false;
+    }
+
+    _initialized = true;
+    ESP_LOGI(TAG, "✅ I2C Master инициализирован успешно");
+    return true;
+}
+
+void I2CMasterController::scanDevices() {
+    if (!_initialized) {
+        ESP_LOGW(TAG, "⚠️ Сканирование невозможно: I2C не инициализирован");
+        return;
+    }
+
+    ESP_LOGI(TAG, "=== 🔍 СКАНИРОВАНИЕ I2C ШИНЫ (адреса 0x08-0x77) ===");
+    uint8_t found_count = 0;
+
+    for (uint8_t addr = 0x08; addr <= 0x77; addr++) {
+        if (isDeviceConnected(addr)) {
+            // Определяем имя устройства по адресу
+            const char* device_name = "Unknown";
+            switch (addr) {
+                case 0x40: device_name = "PCA9685 (PWM driver)"; break;
+                case 0x68: device_name = "MPU6050/MPU9250 (IMU)"; break;
+                case 0x1E: device_name = "HMC5883L (Magnetometer)"; break;
+                case 0x76:
+                case 0x77: device_name = "BMP180/BMP280 (Barometer)"; break;
+                default: break;
+            }
+            ESP_LOGI(TAG, "✅ Устройство: 0x%02X (%s)", addr, device_name);
+            found_count++;
+        }
+        vTaskDelay(1);  // Небольшая задержка для стабильности
+    }
+
+    if (found_count == 0) {
+        ESP_LOGW(TAG, "⚠️ На шине I2C не обнаружено устройств");
+    } else {
+        ESP_LOGI(TAG, "✅ Обнаружено %d устройств(а) на шине I2C", found_count);
+    }
+}
+
+bool I2CMasterController::isDeviceConnected(uint8_t address) {
+    if (!_initialized) return false;
+
+    i2c_cmd_handle_t cmd = i2c_cmd_link_create();
+    i2c_master_start(cmd);
+    i2c_master_write_byte(cmd, (address << 1) | I2C_MASTER_WRITE, true);
+    i2c_master_stop(cmd);
+
+    esp_err_t err = _i2c_master_cmd_begin(cmd);
+    i2c_cmd_link_delete(cmd);
+
+    if (err == ESP_OK) {
+        ESP_LOGD(TAG, "Устройство 0x%02X отвечает", address);
+        return true;
+    } else {
+        ESP_LOGD(TAG, "Устройство 0x%02X не отвечает (%s)",
+                 address, esp_err_to_name(err));
+        return false;
+    }
+}
+
+bool I2CMasterController::readRegister(uint8_t dev_addr, uint8_t reg_addr,
+                                       uint8_t* data, size_t len) {
+    if (!_initialized || !data || len == 0) return false;
+
+    ESP_LOGV(TAG, "Чтение: устройство=0x%02X, регистр=0x%02X, длина=%u",
+             dev_addr, reg_addr, len);
+
+    i2c_cmd_handle_t cmd = i2c_cmd_link_create();
+
+    // Запись адреса регистра
+    i2c_master_start(cmd);
+    i2c_master_write_byte(cmd, (dev_addr << 1) | I2C_MASTER_WRITE, true);
+    i2c_master_write_byte(cmd, reg_addr, true);
+
+    // Чтение данных (повторный старт)
+    i2c_master_start(cmd);
+    i2c_master_write_byte(cmd, (dev_addr << 1) | I2C_MASTER_READ, true);
+
+    if (len > 1) {
+        i2c_master_read(cmd, data, len - 1, I2C_MASTER_ACK);
+    }
+    i2c_master_read_byte(cmd, data + len - 1, I2C_MASTER_NACK);
+
+    i2c_master_stop(cmd);
+
+    esp_err_t err = _i2c_master_cmd_begin(cmd);
+    i2c_cmd_link_delete(cmd);
+
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "❌ Ошибка чтения регистра 0x%02X устройства 0x%02X: %s",
+                 reg_addr, dev_addr, esp_err_to_name(err));
+        return false;
+    }
+
+    // Отладочный вывод прочитанных данных
+    ESP_LOGV(TAG, "📥 Данные: [");
+    for (size_t i = 0; i < len; i++) {
+        ESP_LOGV(TAG, "0x%02X%s", data[i], (i < len - 1) ? " " : "");
+    }
+    ESP_LOGV(TAG, "]");
+
+    return true;
+}
+
+bool I2CMasterController::writeRegister(uint8_t dev_addr, uint8_t reg_addr,
+                                        const uint8_t* data, size_t len) {
+    if (!_initialized || !data || len == 0) return false;
+
+    ESP_LOGV(TAG, "Запись: устройство=0x%02X, регистр=0x%02X, длина=%u",
+             dev_addr, reg_addr, len);
+
+    i2c_cmd_handle_t cmd = i2c_cmd_link_create();
+
+    i2c_master_start(cmd);
+    i2c_master_write_byte(cmd, (dev_addr << 1) | I2C_MASTER_WRITE, true);
+    i2c_master_write_byte(cmd, reg_addr, true);
+
+    for (size_t i = 0; i < len; i++) {
+        i2c_master_write_byte(cmd, data[i], true);
+    }
+
+    i2c_master_stop(cmd);
+
+    esp_err_t err = _i2c_master_cmd_begin(cmd);
+    i2c_cmd_link_delete(cmd);
+
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "❌ Ошибка записи в регистр 0x%02X устройства 0x%02X: %s",
+                 reg_addr, dev_addr, esp_err_to_name(err));
+        return false;
+    }
+
+    ESP_LOGV(TAG, "✅ Запись успешна");
+    return true;
+}
+
+bool I2CMasterController::transfer(uint8_t dev_addr,
+                                   const uint8_t* write_buffer, size_t write_size,
+                                   uint8_t* read_buffer, size_t read_size) {
+    if (!_initialized) return false;
+
+    i2c_cmd_handle_t cmd = i2c_cmd_link_create();
+
+    // Запись (если есть)
+    if (write_size > 0 && write_buffer) {
+        i2c_master_start(cmd);
+        i2c_master_write_byte(cmd, (dev_addr << 1) | I2C_MASTER_WRITE, true);
+        for (size_t i = 0; i < write_size; i++) {
+            i2c_master_write_byte(cmd, write_buffer[i], true);
+        }
+    }
+
+    // Чтение (если есть)
+    if (read_size > 0 && read_buffer) {
+        if (write_size > 0) {
+            i2c_master_start(cmd);  // Повторный старт
+        }
+        i2c_master_write_byte(cmd, (dev_addr << 1) | I2C_MASTER_READ, true);
+
+        if (read_size > 1) {
+            i2c_master_read(cmd, read_buffer, read_size - 1, I2C_MASTER_ACK);
+        }
+        i2c_master_read_byte(cmd, read_buffer + read_size - 1, I2C_MASTER_NACK);
+    }
+
+    i2c_master_stop(cmd);
+
+    esp_err_t err = _i2c_master_cmd_begin(cmd);
+    i2c_cmd_link_delete(cmd);
+
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "❌ Ошибка передачи с устройством 0x%02X: %s",
+                 dev_addr, esp_err_to_name(err));
+        return false;
+    }
+
+    return true;
+}
+
+esp_err_t I2CMasterController::_i2c_master_cmd_begin(i2c_cmd_handle_t cmd_handle) {
+    return i2c_master_cmd_begin(I2C_MASTER_NUM, cmd_handle,
+                               pdMS_TO_TICKS(I2C_MASTER_TIMEOUT_MS));
+}
+
+📁 ПАПКА: modules//imu_handler/
+
+=== Файл: ./modules//imu_handler//MPU9250_Handler.h ===
+
+
+//📄 **Файл:** `MPU9250_Handler.h` (создаётся на основе `GY87_Handler.h`)
+//⚙️ **Класс:** `class MPU9250Handler`
+//💻 **Код:**
+//cpp
+//
+
+#pragma once
+#ifndef MPU9250_HANDLER_H
+#define MPU9250_HANDLER_H
+
+#include <Arduino.h>
+#include "esp_log.h"
+#include "CommonTypes.h"
+#include "I2C_Master.h"
+#include "FilterManager.h"
+
+/**
+ * @file MPU9250_Handler.h
+ * @brief Обработчик 9-осевого датчика MPU-9250 (MPU6500 + AK8963)
+ * @version 1.0.0
+ * @date 2026-04-03
+ * @details
+ * Заменяет устаревший GY87_Handler (MPU6050).
+ * Поддерживает: акселерометр, гироскоп, магнитометр, температуру.
+ * Использует комплементарный фильтр для Roll/Pitch и сырые данные магнитометра для Yaw.
+ * Архитектура: неблокирующая, I2C Master, калибровка гироскопа при старте.
+ */
+
+class MPU9250Handler {
+public:
+    // 🔧 В СЕКЦИЮ PUBLIC КЛАССА MPU9250Handler ДОБАВИТЬ:
+    FilterManager filterManager; ///< 🔑 Менеджер адаптивной фильтрации
+    MPU9250Handler();
+    bool begin(I2CMasterController& i2c_manager);
+    bool isInitialized() const { return _initialized; }
+    bool isDataValid() const  { return _initialized && _gyroCalibrated && (_sensorData.status & 0x01); }
+    bool updateSensors();
+    const SensorData& getData() const { return _sensorData; }
+
+    // Геттеры для обратной совместимости
+    float getAccelX_mss() const { return _sensorData.accel.x; }
+    float getGyroX_rads() const { return _sensorData.gyro.x; }
+    float getMagX_uT()    const { return _sensorData.mag.x; }
+    float getTemperature_C() const { return _sensorData.temperature; }
+
+private:
+    // FilterManager _filter;
+    bool _magAvailable = false; // если магнитометр отключён
+    I2CMasterController* _i2cManager;
+    bool _initialized;
+    SensorData _sensorData;
+
+    // Калибровка гироскопа
+    bool _gyroCalibrated;
+    uint16_t _calibrationCount;
+    float _gyroOffsetX, _gyroOffsetY, _gyroOffsetZ;
+
+    // Магнитометр AK8963
+    float _magSensitivity[3]; ///< Заводская чувствительность (0.6 uT/LSB * ASA)
+    uint32_t _lastUpdate;
+
+    bool _initMPU6500();
+    bool _enableI2CBypass();
+    bool _initAK8963();
+    bool _readRawData(int16_t accel[3], int16_t gyro[3], int16_t temp, int16_t mag[3]);
+    void _applyComplementaryFilter(float dt);
+};
+#endif // MPU9250_HANDLER_H
+
+
+=== Файл: ./modules//imu_handler//MPU9250_Handler.cpp ===
+
+
+
+// 📄 **Файл:** `MPU9250_Handler.cpp` (фрагменты, которые нужно добавить/заменить)
+// ⚙️ **Функция:** `bool MPU9250Handler::begin(I2CMasterController& i2c_manager)`
+// 💻 **Код:**
+// cpp
+//
+#include "modules/imu_handler/MPU9250_Handler.h"
+// #include "MPU9250_Handler.h"
+#include <cmath>
+
+// Константы регистров MPU-9250
+#define MPU6500_ADDR        0x68
+#define AK8963_ADDR         0x0C
+#define PWR_MGMT_1          0x6B
+#define INT_PIN_CFG         0x37
+#define I2C_BYPASS_EN       0x02  // Bit 1
+#define AK8963_WIA          0x00  // Who Am I (0x48)
+#define AK8963_CNTL1        0x0A  // Control 1
+#define AK8963_ASAX         0x10  // Sensitivity Adjustment
+
+static const char* TAG_MPU = "MPU9250";
+
+MPU9250Handler::MPU9250Handler() : _i2cManager(nullptr), _initialized(false), _gyroCalibrated(false), _calibrationCount(0), _lastUpdate(0) {
+    memset(&_sensorData, 0, sizeof(_sensorData));
+}
+
+bool MPU9250Handler::begin(I2CMasterController& i2c_manager) {
+    ESP_LOGI(TAG_MPU, "=== 🚀 ИНИЦИАЛИЗАЦИЯ MPU-9250 (9-AXIS) ===");
+    _i2cManager = &i2c_manager;
+
+    if (!_initMPU6500()) {
+        ESP_LOGE(TAG_MPU, "❌ Ошибка инициализации MPU6500");
+        return false;
+    }
+    if (!_enableI2CBypass()) {
+        ESP_LOGE(TAG_MPU, "❌ Ошибка включения I2C Bypass для AK8963");
+        return false;
+    }
+    if (!_initAK8963()) {
+        ESP_LOGE(TAG_MPU, "❌ Ошибка инициализации магнитометра AK8963");
+        return false;
+    }
+
+    _initialized = true;
+    ESP_LOGI(TAG_MPU, "✅ MPU-9250 инициализирован. Калибровка гироскопа запущена...");
+    return true;
+}
+
+
+// ⚙️ **Функция:** `bool MPU9250Handler::updateSensors()`
+// 💻 **Код:**
+// 
+bool MPU9250Handler::updateSensors() {
+    if (!_initialized || !_i2cManager) return false;
+
+    uint32_t now = micros(); // 🔑 Высокоточный таймер
+    float dt = (now - _lastUpdate) * 1e-6f;
+    if (dt < 0.004f || dt > 0.1f) dt = 0.004f; // Защита от джиттера (min 4ms / 250Hz)
+    _lastUpdate = now;
+
+    int16_t rawAccel[3], rawGyro[3], rawMag[3], rawTemp = 0;
+    if (!_readRawData(rawAccel, rawGyro, rawTemp, rawMag)) {
+        ESP_LOGW(TAG_MPU, "⚠️ Сбой чтения данных");
+        return false;
+    }
+
+    // Калибровка гироскопа (пропускаем первые 200 семплов)
+    if (!_gyroCalibrated && _calibrationCount < 200) {
+        _gyroOffsetX += rawGyro[0]; _gyroOffsetY += rawGyro[1]; _gyroOffsetZ += rawGyro[2];
+        _calibrationCount++;
+        if (_calibrationCount == 200) {
+            _gyroOffsetX /= 200.0f; _gyroOffsetY /= 200.0f; _gyroOffsetZ /= 200.0f;
+            _gyroCalibrated = true;
+            _sensorData.status |= 0x03;
+            ESP_LOGI(TAG_MPU, "✅ Калибровка гироскопа завершена");
+        }
+        return true;
+    }
+
+    // Масштабирование
+    constexpr float ACCEL_SCALE = 9.80665f / 16384.0f;
+    constexpr float GYRO_SCALE  = (250.0f / 32768.0f) * (M_PI / 180.0f);
+    _sensorData.accel.x = rawAccel[0] * ACCEL_SCALE;
+    _sensorData.accel.y = rawAccel[1] * ACCEL_SCALE;
+    _sensorData.accel.z = rawAccel[2] * ACCEL_SCALE;
+    _sensorData.gyro.x  = (rawGyro[0] - _gyroOffsetX) * GYRO_SCALE;
+    _sensorData.gyro.y  = (rawGyro[1] - _gyroOffsetY) * GYRO_SCALE;
+    _sensorData.gyro.z  = (rawGyro[2] - _gyroOffsetZ) * GYRO_SCALE;
+    _sensorData.mag.x   = rawMag[0] * _magSensitivity[0];
+    _sensorData.mag.y   = rawMag[1] * _magSensitivity[1];
+    _sensorData.mag.z   = rawMag[2] * _magSensitivity[2];
+    _sensorData.temperature = (rawTemp / 333.87f) + 21.0f;
+
+    // 🔑 ИНТЕГРАЦИЯ АДАПТИВНОГО ФИЛЬТРА
+    // Извлекаем данные в локальные переменные для передачи в FilterManager
+    float ax = _sensorData.accel.x, ay = _sensorData.accel.y, az = _sensorData.accel.z;
+    float gx = _sensorData.gyro.x, gy = _sensorData.gyro.y, gz = _sensorData.gyro.z;
+    float mx = _sensorData.mag.x, my = _sensorData.mag.y, mz = _sensorData.mag.z;
+
+    filterManager.update(dt, ax, ay, az, gx, gy, gz, mx, my, mz);
+    filterManager.getEuler(_sensorData.roll, _sensorData.pitch, _sensorData.yaw);
+
+    _sensorData.status |= 0x01;
+    return true;
+}
+
+void MPU9250Handler::_applyComplementaryFilter(float dt) {
+    if (dt <= 0.0f) dt = 0.01f;
+    const float ALPHA = 0.98f; // Коэффициент фильтра (оптимально для 100Гц)
+
+    // Интегрирование гироскопа (градусы)
+    float gyroRoll  = _sensorData.roll  + (_sensorData.gyro.x * dt * (180.0f / M_PI));
+    float gyroPitch = _sensorData.pitch + (_sensorData.gyro.y * dt * (180.0f / M_PI));
+
+    // Коррекция акселерометром (гравитационный вектор)
+    float accRoll  = atan2f(_sensorData.accel.y, _sensorData.accel.z) * (180.0f / M_PI);
+    float accPitch = atan2f(-_sensorData.accel.x, 
+                           sqrtf(_sensorData.accel.y * _sensorData.accel.y + _sensorData.accel.z * _sensorData.accel.z)) * (180.0f / M_PI);
+
+    // Комплементарный фильтр
+    _sensorData.roll  = ALPHA * gyroRoll  + (1.0f - ALPHA) * accRoll;
+    _sensorData.pitch = ALPHA * gyroPitch + (1.0f - ALPHA) * accPitch;
+
+    // Yaw из магнитометра (с компенсацией наклона)
+    float magX = _sensorData.mag.x * cosf(_sensorData.pitch * M_PI / 180.0f) +
+                 _sensorData.mag.z * sinf(_sensorData.pitch * M_PI / 180.0f);
+    float magY = _sensorData.mag.x * sinf(_sensorData.roll * M_PI / 180.0f) * sinf(_sensorData.pitch * M_PI / 180.0f) +
+                 _sensorData.mag.y * cosf(_sensorData.roll * M_PI / 180.0f) -
+                 _sensorData.mag.z * sinf(_sensorData.roll * M_PI / 180.0f) * cosf(_sensorData.pitch * M_PI / 180.0f);
+    
+    _sensorData.yaw = atan2f(-magY, magX) * (180.0f / M_PI);
+    if (_sensorData.yaw < 0) _sensorData.yaw += 360.0f;
+}
+
+// ============================================================================
+// 🔧 РЕАЛИЗАЦИЯ ПРИВАТНЫХ МЕТОДОВ (заглушки для MVP)
+// Файл: MPU9250_Handler.cpp | Позиция: конец файла
+// ============================================================================
+
+/**
+ * @brief Инициализация MPU6500 (акселерометр+гироскоп)
+ * @return true при успехе
+ */
+bool MPU9250Handler::_initMPU6500() {
+    ESP_LOGI(TAG_MPU, "⚙️  _initMPU6500: сброс питания...");
+    
+    // Сброс через PWR_MGMT_1
+    uint8_t data = 0x80;  // Bit 7: DEVICE_RESET
+    if (!_i2cManager->writeRegister(MPU6500_ADDR, PWR_MGMT_1, &data, 1)) {
+        ESP_LOGE(TAG_MPU, "❌ Не удалось сбросить MPU6500");
+        return false;
+    }
+    delay(100);  // Ждём сброса
+    
+    // Выход из сна, выбор источника тактирования
+    data = 0x01;  // CLKSEL=PLL with X axis gyroscope reference
+    if (!_i2cManager->writeRegister(MPU6500_ADDR, PWR_MGMT_1, &data, 1)) {
+        ESP_LOGE(TAG_MPU, "❌ Не удалось выйти из сна MPU6500");
+        return false;
+    }
+    delay(10);
+    
+    // Настройка DLPF (Digital Low Pass Filter)
+    data = 0x03;  // DLPF_CFG=3 → 41Hz bandwidth
+    if (!_i2cManager->writeRegister(MPU6500_ADDR, 0x1A, &data, 1)) {  // CONFIG reg
+        ESP_LOGE(TAG_MPU, "❌ Не удалось настроить DLPF");
+        return false;
+    }
+    
+    // Настройка гироскопа: ±250 °/с
+    data = 0x00;  // GYRO_FS_SEL=0 → ±250°/s
+    if (!_i2cManager->writeRegister(MPU6500_ADDR, 0x1B, &data, 1)) {  // GYRO_CONFIG
+        ESP_LOGE(TAG_MPU, "❌ Не удалось настроить гироскоп");
+        return false;
+    }
+    
+    // Настройка акселерометра: ±2g
+    data = 0x00;  // ACCEL_FS_SEL=0 → ±2g
+    if (!_i2cManager->writeRegister(MPU6500_ADDR, 0x1C, &data, 1)) {  // ACCEL_CONFIG
+        ESP_LOGE(TAG_MPU, "❌ Не удалось настроить акселерометр");
+        return false;
+    }
+    
+    // Проверка WHO_AM_I (должно быть 0x71 для MPU6500)
+    uint8_t whoami;
+    if (!_i2cManager->readRegister(MPU6500_ADDR, 0x75, &whoami, 1)) {
+        ESP_LOGE(TAG_MPU, "❌ Не удалось прочитать WHO_AM_I");
+        return false;
+    }
+    if (whoami != 0x71) {
+        ESP_LOGE(TAG_MPU, "❌ WHO_AM_I mismatch: ожидал 0x71, получил 0x%02X", whoami);
+        return false;
+    }
+    
+    ESP_LOGI(TAG_MPU, "✅ MPU6500 инициализирован (WHO_AM_I=0x%02X)", whoami);
+    return true;
+}
+
+/**
+ * @brief Включение I2C Bypass для доступа к магнитометру AK8963
+ * @return true при успехе
+ */
+bool MPU9250Handler::_enableI2CBypass() {
+    ESP_LOGI(TAG_MPU, "⚙️  _enableI2CBypass: включение bypass...");
+    
+    // INT_PIN_CFG: бит 1 (BYPASS_EN) = 1, бит 4 (INT_LEVEL) = 0 (active high)
+    uint8_t data = 0x12;  // 0b00010010: BYPASS_EN + INT_RD_CLEAR
+    if (!_i2cManager->writeRegister(MPU6500_ADDR, INT_PIN_CFG, &data, 1)) {
+        ESP_LOGE(TAG_MPU, "❌ Не удалось включить I2C Bypass");
+        return false;
+    }
+    delay(10);
+    
+    // Проверка: чтение из AK8963 должно работать
+    uint8_t whoami;
+    if (!_i2cManager->readRegister(AK8963_ADDR, AK8963_WIA, &whoami, 1)) {
+        ESP_LOGE(TAG_MPU, "❌ Не удалось прочитать AK8963 WHO_AM_I");
+        return false;
+    }
+    if (whoami != 0x48) {
+        ESP_LOGE(TAG_MPU, "❌ AK8963 WHO_AM_I mismatch: ожидал 0x48, получил 0x%02X", whoami);
+        return false;
+    }
+    
+    ESP_LOGI(TAG_MPU, "✅ I2C Bypass включён, AK8963 обнаружен (0x%02X)", whoami);
+    return true;
+}
+
+/**
+ * @brief Инициализация магнитометра AK8963
+ * @return true при успехе
+ */
+bool MPU9250Handler::_initAK8963() {
+    ESP_LOGI(TAG_MPU, "⚙️  _initAK8963: настройка магнитометра...");
+    
+    // Сначала перевести в Power-Down режим
+    uint8_t data = 0x00;
+    if (!_i2cManager->writeRegister(AK8963_ADDR, AK8963_CNTL1, &data, 1)) {
+        ESP_LOGE(TAG_MPU, "❌ Не удалось перевести AK8963 в Power-Down");
+        return false;
+    }
+    delay(10);
+    
+    // Чтение калибровочных коэффициентов (ASA)
+    // Режим: Fuse ROM access (0x0F)
+    data = 0x0F;
+    if (!_i2cManager->writeRegister(AK8963_ADDR, AK8963_CNTL1, &data, 1)) {
+        ESP_LOGE(TAG_MPU, "❌ Не удалось войти в режим Fuse ROM");
+        return false;
+    }
+    delay(10);
+    
+    // Чтение чувствительности (0x10-0x12)
+    uint8_t asa[3];
+    if (!_i2cManager->readRegister(AK8963_ADDR, AK8963_ASAX, asa, 3)) {
+        ESP_LOGE(TAG_MPU, "❌ Не удалось прочитать ASA коэффициенты");
+        return false;
+    }
+    
+    // Расчёт чувствительности: 0.6 uT/LSB * ((ASA-128)*0.5/128 + 1)
+    for (int i = 0; i < 3; i++) {
+        _magSensitivity[i] = 0.6f * ((asa[i] - 128.0f) * 0.5f / 128.0f + 1.0f);
+    }
+    ESP_LOGI(TAG_MPU, "   📊 ASA: [%d,%d,%d] → Sens: [%.3f,%.3f,%.3f] uT/LSB",
+             asa[0], asa[1], asa[2],
+             _magSensitivity[0], _magSensitivity[1], _magSensitivity[2]);
+    
+    // Возврат в Power-Down
+    data = 0x00;
+    _i2cManager->writeRegister(AK8963_ADDR, AK8963_CNTL1, &data, 1);
+    delay(10);
+    
+    // Установка режима: 16-bit output, 100Hz ODR
+    data = 0x16;  // 0b00010110: 16-bit + 100Hz
+    if (!_i2cManager->writeRegister(AK8963_ADDR, AK8963_CNTL1, &data, 1)) {
+        ESP_LOGE(TAG_MPU, "❌ Не удалось установить режим AK8963");
+        return false;
+    }
+    
+    ESP_LOGI(TAG_MPU, "✅ AK8963 инициализирован: 16-bit, 100Hz");
+    return true;
+}
+
+/**
+ * @brief Чтение сырых данных со всех сенсоров
+ * @param accel[out] Массив [3] для акселерометра
+ * @param gyro[out]  Массив [3] для гироскопа  
+ * @param temp[out]  Температура
+ * @param mag[out]   Массив [3] для магнитометра
+ * @return true при успехе
+ */
+// MPU9250_Handler.cpp — функция _readRawData
+// 🔧 Добавьте (void)temp для подавления предупреждения:
+bool MPU9250Handler::_readRawData(int16_t accel[3], int16_t gyro[3], int16_t temp, int16_t mag[3]) {
+    (void)temp;  // 🔧 Подавляем предупреждение: параметр пока не используется
+    // Чтение акселерометра+гироскопа+температуры (14 регистров подряд)
+    // ACCEL_XOUT_H = 0x3B, всего 14 байт
+    uint8_t buffer[14];
+    if (!_i2cManager->readRegister(MPU6500_ADDR, 0x3B, buffer, 14)) {
+        ESP_LOGW(TAG_MPU, "⚠️ Сбой чтения MPU6500 данных");
+        return false;
+    }
+    
+    // Декодирование (big-endian)
+    accel[0] = (buffer[0] << 8) | buffer[1];   // ACCEL_X
+    accel[1] = (buffer[2] << 8) | buffer[3];   // ACCEL_Y
+    accel[2] = (buffer[4] << 8) | buffer[5];   // ACCEL_Z
+    temp     = (buffer[6] << 8) | buffer[7];   // TEMP
+    gyro[0]  = (buffer[8] << 8) | buffer[9];   // GYRO_X
+    gyro[1]  = (buffer[10] << 8) | buffer[11]; // GYRO_Y
+    gyro[2]  = (buffer[12] << 8) | buffer[13]; // GYRO_Z
+    
+    // Чтение магнитометра (7 регистров: ST1 + 6 байт данных + ST2)
+    // ST1 регистр = 0x02, проверка бит 0 (DRDY)
+    uint8_t magBuffer[7];
+    if (!_i2cManager->readRegister(AK8963_ADDR, 0x02, magBuffer, 7)) {
+        ESP_LOGW(TAG_MPU, "⚠️ Сбой чтения AK8963 данных");
+        // Не фатально: продолжаем без магнитометра
+        mag[0] = mag[1] = mag[2] = 0;
+        return true;
+    }
+    
+    // Проверка: бит 0 = 1 (данные готовы), бит 3 = 0 (нет ошибки)
+    if ((magBuffer[0] & 0x01) == 0 || (magBuffer[0] & 0x08) != 0) {
+        ESP_LOGW(TAG_MPU, "⚠️ AK8963: данные не готовы или ошибка");
+        mag[0] = mag[1] = mag[2] = 0;
+        return true;  // Не фатально
+    }
+    
+    // Декодирование магнитометра (little-endian!)
+    mag[0] = (int16_t)((magBuffer[2] << 8) | magBuffer[1]);  // MAG_X
+    mag[1] = (int16_t)((magBuffer[4] << 8) | magBuffer[3]);  // MAG_Y
+    mag[2] = (int16_t)((magBuffer[6] << 8) | magBuffer[5]);  // MAG_Z
+    
+    return true;
+}
+
+📁 ПАПКА: modules//lora_communicator/
+
+=== Файл: ./modules//lora_communicator//lora_communicator.h ===
+/**
+ * @file lora_communicator.h
+ * @brief Неблокирующий LoRa приёмник (SX1278) с FSM и ACK
+ * @details 
+ * - Адаптирован под RadioLib 7.6.0 и ESP32-S3
+ * - Использует прерывания DIO0/DIO1 для пробуждения
+ * - Конечный автомат (FSM): INIT -> LISTENING -> PROCESSING -> SENDING_ACK -> LISTENING
+ * - Подробная отладка через ESP_LOG
+ * @version 2.0 (PlatformIO Migration)
+ */
+#pragma once
+#include <Arduino.h>
+#include <esp_log.h>
+#include <RadioLib.h>
+#include "config/pins.h"
+#include "common/types.h"
+
+#define LORA_TAG "LORA_RX"
+
+enum class LoRaState : uint8_t {
+    INIT = 0,
+    LISTENING = 1,
+    PROCESSING = 2,
+    SENDING_ACK = 3,
+    ERROR = 4
+};
+
+class LoRaReceiver {
+public:
+    LoRaReceiver();
+    ~LoRaReceiver();
+
+    /** @brief Инициализация радио, настройка прерываний, запуск приёма */
+    bool begin();
+    /** @brief Обновление FSM. Вызывать регулярно в loop() */
+    void update();
+    /** @brief Проверка готовности нового пакета */
+    bool packetAvailable() const;
+    /** @brief Чтение пакета. Возвращает размер данных или 0 */
+    size_t readPacket(DataComSet_t& outPacket);
+    /** @brief Отправка ACK для указанного ID пакета */
+    bool sendAck(uint16_t packetId);
+    /** @brief Получение копии статистики */
+    ReceiverStats getStats() const;
+    /** @brief Сброс статистики */
+    void resetStats();
+    /** @brief Проверка активности соединения (< 5 сек) */
+    bool isConnected() const;
+
+private:
+    SX1278* _radio = nullptr;
+    Module* _module = nullptr;
+    
+    LoRaState _state = LoRaState::INIT;
+    bool _initialized = false;
+    
+    DataComSet_t _rxBuffer;
+    volatile bool _dataReady = false;
+    volatile uint16_t _ackIdPending = 0;
+    
+    ReceiverStats _stats;
+    mutable portMUX_TYPE _mux = portMUX_INITIALIZER_UNLOCKED;
+
+    void handleRxDone();
+    bool validatePacket(const DataComSet_t& pkt);
+    void returnToRx();
+    
+    friend void IRAM_ATTR onLoraDio0ISR();
+    friend void IRAM_ATTR onLoraDio1ISR();
+    static LoRaReceiver* _instance;
+};
+
+// Глобальные ISR
+void IRAM_ATTR onLoraDio0ISR();
+void IRAM_ATTR onLoraDio1ISR();
+
+=== Файл: ./modules//lora_communicator//lora_communicator.cpp ===
+/**
+ * @file lora_communicator.cpp
+ * @brief Реализация LoRa приёмника для ESP32-S3 (RadioLib 7.6.0)
+ * @details 
+ * - Адаптированы вызовы API: transmit(data, len), clearIrqFlags(), getIrqFlags()
+ * - Добавлена потокобезопасность (мьютекс) для ISR и loop()
+ * - Вся отладка переведена на ESP_LOG
+ */
+#include "modules/lora_communicator/lora_communicator.h"
+// #include "lora_communicator.h"
+#include "config/pins.h"
+#include "common/CommonTypes.h"
+
+// Таблица CRC8 (полином 0x07)
+static const uint8_t CRC8_TABLE[256] = {
+    0x00, 0x07, 0x0E, 0x09, 0x1C, 0x1B, 0x12, 0x15, 0x38, 0x3F, 0x36, 0x31, 0x24, 0x23, 0x2A, 0x2D,
+    0x70, 0x77, 0x7E, 0x79, 0x6C, 0x6B, 0x62, 0x65, 0x48, 0x4F, 0x46, 0x41, 0x54, 0x53, 0x5A, 0x5D,
+    0xE0, 0xE7, 0xEE, 0xE9, 0xFC, 0xFB, 0xF2, 0xF5, 0xD8, 0xDF, 0xD6, 0xD1, 0xC4, 0xC3, 0xCA, 0xCD,
+    0x90, 0x97, 0x9E, 0x99, 0x8C, 0x8B, 0x82, 0x85, 0xA8, 0xAF, 0xA6, 0xA1, 0xB4, 0xB3, 0xBA, 0xBD,
+    0xC7, 0xC0, 0xC9, 0xCE, 0xDB, 0xDC, 0xD5, 0xD2, 0xFF, 0xF8, 0xF1, 0xF6, 0xE3, 0xE4, 0xED, 0xEA,
+    0xB7, 0xB0, 0xB9, 0xBE, 0xAB, 0xAC, 0xA5, 0xA2, 0x8F, 0x88, 0x81, 0x86, 0x93, 0x94, 0x9D, 0x9A,
+    0x27, 0x20, 0x29, 0x2E, 0x3B, 0x3C, 0x35, 0x32, 0x1F, 0x18, 0x11, 0x16, 0x03, 0x04, 0x0D, 0x0A,
+    0x57, 0x50, 0x59, 0x5E, 0x4B, 0x4C, 0x45, 0x42, 0x6F, 0x68, 0x61, 0x66, 0x73, 0x74, 0x7D, 0x7A,
+    0x89, 0x8E, 0x87, 0x80, 0x95, 0x92, 0x9B, 0x9C, 0xB1, 0xB6, 0xBF, 0xB8, 0xAD, 0xAA, 0xA3, 0xA4,
+    0xF9, 0xFE, 0xF7, 0xF0, 0xE5, 0xE2, 0xEB, 0xEC, 0xC1, 0xC6, 0xCF, 0xC8, 0xDD, 0xDA, 0xD3, 0xD4,
+    0x69, 0x6E, 0x67, 0x60, 0x75, 0x72, 0x7B, 0x7C, 0x51, 0x56, 0x5F, 0x58, 0x4D, 0x4A, 0x43, 0x44,
+    0x19, 0x1E, 0x17, 0x10, 0x05, 0x02, 0x0B, 0x0C, 0x21, 0x26, 0x2F, 0x28, 0x3D, 0x3A, 0x33, 0x34,
+    0x4E, 0x49, 0x40, 0x47, 0x52, 0x55, 0x5C, 0x5B, 0x76, 0x71, 0x78, 0x7F, 0x6A, 0x6D, 0x64, 0x63,
+    0x3E, 0x39, 0x30, 0x37, 0x22, 0x25, 0x2C, 0x2B, 0x06, 0x01, 0x08, 0x0F, 0x1A, 0x1D, 0x14, 0x13,
+    0xAE, 0xA9, 0xA0, 0xA7, 0xB2, 0xB5, 0xBC, 0xBB, 0x96, 0x91, 0x98, 0x9F, 0x8A, 0x8D, 0x84, 0x83,
+    0xDE, 0xD9, 0xD0, 0xD7, 0xC2, 0xC5, 0xCC, 0xCB, 0xE6, 0xE1, 0xE8, 0xEF, 0xFA, 0xFD, 0xF4, 0xF3
+};
+
+uint8_t calculateCRC8(const uint8_t* data, size_t length) {
+    uint8_t crc = 0x00;
+    for (size_t i = 0; i < length; i++) crc = CRC8_TABLE[crc ^ data[i]];
+    return crc;
+}
+
+LoRaReceiver* LoRaReceiver::_instance = nullptr;
+
+LoRaReceiver::LoRaReceiver() {
+    _instance = this; // Привязка для ISR
+    ESP_LOGI(LORA_TAG, "Constructor: Instance bound to %p", this);
+}
+
+LoRaReceiver::~LoRaReceiver() {
+    if (_radio) delete _radio;
+    if (_module) delete _module;
+    if (_instance == this) _instance = nullptr;
+    ESP_LOGI(LORA_TAG, "Destructor: Cleanup complete");
+}
+
+bool LoRaReceiver::begin() {
+    ESP_LOGI(LORA_TAG, "📡 Initializing SX1278...");
+    
+    // Создаём объекты RadioLib
+    _module = new Module(Config::Pins::LORA_CS, Config::Pins::LORA_DIO0, 
+                         Config::Pins::LORA_RST, Config::Pins::LORA_DIO1, SPI);
+    _radio = new SX1278(_module);
+    if (!_radio || !_module) {
+        ESP_LOGE(LORA_TAG, "❌ Failed to allocate RadioLib objects");
+        return false;
+    }
+
+    // Инициализация радио (RadioLib 7.6.0 API)
+    int state = _radio->begin(Config::Radio::FREQUENCY, Config::Radio::BANDWIDTH,
+                              Config::Radio::SPREADING_FACTOR, Config::Radio::CODING_RATE,
+                              Config::Radio::SYNC_WORD, Config::Radio::OUTPUT_POWER,
+                              Config::Radio::PREAMBLE_LEN);
+    if (state != RADIOLIB_ERR_NONE) {
+        ESP_LOGE(LORA_TAG, "❌ begin() failed: %d", state);
+        return false;
+    }
+    _radio->setCRC(true);
+
+    // Настройка прерываний
+    _radio->setDio0Action(onLoraDio0ISR, RISING);
+    _radio->setDio1Action(onLoraDio1ISR, RISING);
+
+    // Запуск приёма
+    state = _radio->startReceive();
+    if (state != RADIOLIB_ERR_NONE) {
+        ESP_LOGE(LORA_TAG, "❌ startReceive() failed: %d", state);
+        return false;
+    }
+
+    _initialized = true;
+    _state = LoRaState::LISTENING;
+    ESP_LOGI(LORA_TAG, "✅ Receiver READY | Freq:%.1f MHz SF%d", Config::Radio::FREQUENCY, Config::Radio::SPREADING_FACTOR);
+    return true;
+}
+
+void LoRaReceiver::update() {
+    if (!_initialized || !_radio) return;
+
+    switch (_state) {
+        case LoRaState::INIT:
+            _state = LoRaState::LISTENING;
+            break;
+        case LoRaState::LISTENING:
+            // Проверка флагов из ISR
+            if (_dataReady) {
+                _dataReady = false;
+                _state = LoRaState::PROCESSING;
+            }
+            break;
+        case LoRaState::PROCESSING:
+            handleRxDone();
+            break;
+        case LoRaState::SENDING_ACK:
+            // ACK отправляется асинхронно внутри handleRxDone при необходимости
+            _state = LoRaState::LISTENING;
+            returnToRx();
+            break;
+        case LoRaState::ERROR:
+            ESP_LOGW(LORA_TAG, "⚠️ Error state, attempting recovery...");
+            _radio->reset();
+            delay(50);
+            if (_radio->startReceive() == RADIOLIB_ERR_NONE) _state = LoRaState::LISTENING;
+            break;
+    }
+}
+
+void LoRaReceiver::handleRxDone() {
+    uint8_t buf[sizeof(DataComSet_t)];
+    int16_t len = _radio->readData(buf, sizeof(buf));
+    
+    if (len <= 0 || static_cast<size_t>(len) < sizeof(DataComSet_t)) {
+        ESP_LOGW(LORA_TAG, "⚠️ Read failed/short packet (len=%d)", len);
+        _state = LoRaState::LISTENING;
+        returnToRx();
+        return;
+    }
+
+    memcpy(&_rxBuffer, buf, sizeof(DataComSet_t));
+    
+    if (validatePacket(_rxBuffer)) {
+        portENTER_CRITICAL(&_mux);
+        _stats.packetsReceived++;
+        _stats.packetsSuccess++;
+        _stats.lastRssi = _radio->getRSSI();
+        _stats.lastPacketTime = millis();
+        portEXIT_CRITICAL(&_mux);
+        
+        ESP_LOGI(LORA_TAG, "✅ Valid Packet | ID:%u | RSSI:%d dBm", _rxBuffer.packet_id, _stats.lastRssi);
+        
+        if (_rxBuffer.comSetAll & ACK_REQUEST_FLAG) {
+            ESP_LOGD(LORA_TAG, "📤 ACK requested for ID %u", _rxBuffer.packet_id);
+            sendAck(_rxBuffer.packet_id);
+        }
+    } else {
+        portENTER_CRITICAL(&_mux);
+        _stats.crcErrors++;
+        portEXIT_CRITICAL(&_mux);
+    }
+    
+    _state = LoRaState::LISTENING;
+    returnToRx();
+}
+
+bool LoRaReceiver::packetAvailable() const {
+    bool ready;
+    portENTER_CRITICAL((portMUX_TYPE*)&_mux);
+    ready = _dataReady;
+    portEXIT_CRITICAL((portMUX_TYPE*)&_mux);
+    return ready;
+}
+
+size_t LoRaReceiver::readPacket(DataComSet_t& outPacket) {
+    if (!_dataReady) return 0;
+    portENTER_CRITICAL(&_mux);
+    memcpy(&outPacket, &_rxBuffer, sizeof(DataComSet_t));
+    _dataReady = false;
+    portEXIT_CRITICAL(&_mux);
+    return sizeof(DataComSet_t);
+}
+
+bool LoRaReceiver::sendAck(uint16_t packetId) {
+    AckPacket_t ack;
+    ack.packet_id = packetId;
+    ack.timestamp = millis();
+    ack.status = 1;
+    ack.crc8 = calculateCRC8((uint8_t*)&ack.packet_id, sizeof(AckPacket_t) - 3);
+
+    int state = _radio->standby();
+    if (state != RADIOLIB_ERR_NONE) {
+        ESP_LOGE(LORA_TAG, "❌ standby() failed: %d", state);
+        return false;
+    }
+    delayMicroseconds(100);
+
+    // RadioLib 7.6.0: transmit требует данные и длину
+    state = _radio->transmit((uint8_t*)&ack, sizeof(AckPacket_t));
+    
+    if (state == RADIOLIB_ERR_NONE) {
+        portENTER_CRITICAL(&_mux);
+        _stats.acksSent++;
+        _stats.acksSuccess++;
+        portEXIT_CRITICAL(&_mux);
+        ESP_LOGI(LORA_TAG, "✅ ACK sent for ID %u", packetId);
+        return true;
+    }
+    ESP_LOGE(LORA_TAG, "❌ ACK transmit failed: %d", state);
+    return false;
+}
+
+bool LoRaReceiver::validatePacket(const DataComSet_t& pkt) {
+    if (pkt.preamble[0] != 0xAA || pkt.preamble[1] != 0x55) return false;
+    uint8_t calc = calculateCRC8((uint8_t*)&pkt.packet_id, sizeof(DataComSet_t) - 3);
+    return pkt.crc8 == calc;
+}
+
+void LoRaReceiver::returnToRx() {
+    if (_radio->startReceive() != RADIOLIB_ERR_NONE) {
+        ESP_LOGW(LORA_TAG, "⚠️ Failed to return to RX mode");
+        _state = LoRaState::ERROR;
+    }
+}
+
+ReceiverStats LoRaReceiver::getStats() const {
+    ReceiverStats s;
+    portENTER_CRITICAL((portMUX_TYPE*)&_mux);
+    s = _stats;
+    portEXIT_CRITICAL((portMUX_TYPE*)&_mux);
+    return s;
+}
+
+void LoRaReceiver::resetStats() {
+    portENTER_CRITICAL(&_mux);
+    memset(&_stats, 0, sizeof(_stats));
+    portEXIT_CRITICAL(&_mux);
+}
+
+bool LoRaReceiver::isConnected() const {
+    return (millis() - _stats.lastPacketTime) < Config::Timing::CONNECTION_TIMEOUT_MS;
+}
+
+// ISR функции (должны быть глобальными для RadioLib)
+void IRAM_ATTR onLoraDio0ISR() {
+    if (LoRaReceiver::_instance) {
+        portENTER_CRITICAL_ISR(&LoRaReceiver::_instance->_mux);
+        LoRaReceiver::_instance->_dataReady = true;
+        portEXIT_CRITICAL_ISR(&LoRaReceiver::_instance->_mux);
+    }
+}
+
+void IRAM_ATTR onLoraDio1ISR() {
+    if (LoRaReceiver::_instance) {
+        // Таймаут приёма: просто перезапускаем приём
+        _instance->_radio->startReceive();
+    }
+}
+
+📁 ПАПКА: modules//pca9685_servo/
+
+=== Файл: ./modules//pca9685_servo//pca9685_servo.h ===
+/**
+ * @file pca9685_servo.h
+ * @brief Контроллер сервоприводов через PCA9685 (Adafruit-style)
+ * @details
+ * - Управление 7 сервоприводами через один чип PCA9685
+ * - Подключение по шине I2C: SDA=GPIO8, SCL=GPIO9 (Config::Pins)
+ * - Частота PWM: 50 Гц (стандарт для сервоприводов)
+ * - Разрешение: 12 бит (4096 тиков, точность ~0.044°)
+ * - Углы безопасности: ±75° макс, буфер ±5° вокруг нейтрали
+ * - Предстартовый тест: 3 цикла, все каналы одновременно
+ *
+ * @environment ESP32-S3-N16R8 | PlatformIO | Arduino Framework
+ * @version 1.0 (миграция из Arduino IDE)
+ * @date 2026-05-26
+ */
+
+#pragma once
+
+#include <Arduino.h>
+#include <esp_log.h>
+#include <cstdint>
+
+#include "../../config/pins.h"
+#include "../../common/types.h"
+#include "../i2c_master/i2c_master.h"
+
+// ============================================================================
+// Регистры PCA9685 (совместимость с Adafruit)
+// ============================================================================
+#define PCA9685_MODE1           0x00    ///< Register: Mode 1
+#define PCA9685_MODE2           0x01    ///< Register: Mode 2
+#define PCA9685_PRESCALE        0xFE    ///< Register: Prescale for PWM frequency
+#define PCA9685_LED0_ON_L       0x06    ///< Register: LED0 On Tick Low Byte
+#define PCA9685_ALL_LED_ON_L    0xFA    ///< Register: All LEDs On Tick Low
+#define PCA9685_ALL_LED_OFF_L   0xFC    ///< Register: All LEDs Off Tick Low
+
+// ============================================================================
+// Битовые маски режимов
+// ============================================================================
+#define PCA9685_MODE1_RESTART   0x80    ///< Restart bit
+#define PCA9685_MODE1_AUTO_INC  0x20    ///< Auto-Increment (КРИТИЧЕСКИ!)
+#define PCA9685_MODE1_SLEEP     0x10    ///< Sleep mode
+#define PCA9685_MODE2_OUTDRV    0x04    ///< Totem pole output drive (для серво)
+
+// ============================================================================
+// Константы PCA9685
+// ============================================================================
+#define PCA9685_I2C_ADDRESS     0x40            ///< Стандартный адрес PCA9685
+#define PCA9685_OSC_CLOCK       25000000UL      ///< Частота осциллятора (25 МГц)
+#define PCA9685_PWM_RESOLUTION  4096            ///< 12-bit разрешение
+#define PCA9685_PWM_FREQUENCY   50              ///< Частота PWM для серво (50 Гц)
+
+// ============================================================================
+// Калибровка сервоприводов (MG90S/SG90)
+// ============================================================================
+#define SERVO_PULSE_MIN_US      500     ///< Мин. импульс (0°)
+#define SERVO_PULSE_MAX_US      2500    ///< Макс. импульс (180°)
+#define SERVO_PULSE_NEUTRAL_US  1500    ///< Нейтраль (90°)
+
+// ============================================================================
+// Углы безопасности (ТЗ п.2.1-2.4)
+// ============================================================================
+#define SERVO_SAFE_MAX_ANGLE    75      ///< Макс. рабочий угол (градусы)
+#define SERVO_NEUTRAL_BUFFER    5       ///< Буферная зона вокруг нейтрали
+
+// ============================================================================
+// Параметры предстартового теста
+// ============================================================================
+#define SERVO_TEST_CYCLES           3           ///< Количество циклов теста
+#define SERVO_TEST_PAUSE_MS         1000        ///< Пауза между циклами
+#define SERVO_TEST_STEP_DELAY_MS    600         ///< Задержка между шагами
+
+// Последовательность углов для теста (логический диапазон -90...+90)
+extern const int16_t SERVO_TEST_SEQUENCE[];
+extern const uint8_t SERVO_TEST_SEQUENCE_SIZE;
+
+// ============================================================================
+// Класс контроллера сервоприводов
+// ============================================================================
+class PCA9685ServoController {
+public:
+    /**
+     * @brief Конструктор контроллера
+     * @param i2c_address I2C адрес PCA9685 (по умолчанию 0x40)
+     */
+    explicit PCA9685ServoController(uint8_t i2c_address = PCA9685_I2C_ADDRESS);
+
+    /**
+     * @brief Инициализация PCA9685
+     * @param i2c_manager Ссылка на инициализированный I2C контроллер
+     * @return true при успешной инициализации
+     */
+    bool begin(I2CMasterController& i2c_manager);
+
+    /**
+     * @brief Установка угла сервопривода (логический диапазон -90°...+90°)
+     * @param servo_index Индекс сервопривода (0-6)
+     * @param logical_angle Угол в градусах (-90...+90, где 0 = нейтраль)
+     * @return true при успехе
+     */
+    bool setLogicalAngle(uint8_t servo_index, int16_t logical_angle);
+
+    /**
+     * @brief Установка угла (физический диапазон 0°...180°)
+     * @param servo_index Индекс сервопривода (0-6)
+     * @param physical_angle Угол в градусах (0-180)
+     * @return true при успехе
+     */
+    bool setPhysicalAngle(uint8_t servo_index, uint16_t physical_angle);
+
+    /**
+     * @brief Прямая установка ширины импульса
+     * @param servo_index Индекс сервопривода (0-6)
+     * @param pulse_us Ширина импульса в микросекундах (500-2500)
+     * @return true при успехе
+     */
+    bool setPulseWidthUs(uint8_t servo_index, uint16_t pulse_us);
+
+    /**
+     * @brief Установка калибровочной коррекции для канала
+     * @param servo_index Индекс сервопривода (0-6)
+     * @param trim_us Коррекция в микросекундах (-200...+200)
+     */
+    void setServoTrim(uint8_t servo_index, int16_t trim_us);
+
+    /**
+     * @brief Сброс всех сервоприводов в нейтральное положение
+     */
+    void resetToNeutral();
+
+    /**
+     * @brief 🔑 Предстартовый тест сервоприводов
+     * @return true при успешном завершении теста
+     * @details
+     * - Все 7 каналов двигаются ОДНОВРЕМЕННО
+     * - Последовательность: 0° → +30° → +60° → 0° → -30° → -60° → 0°
+     * - Задержка между шагами: 600 мс
+     * - Циклов: 3
+     */
+    bool runServoTest();
+
+    /**
+     * @brief Обработка команд пульта с распределением по каналам
+     * @param com_up Команда тангажа (0-180)
+     * @param com_left Команда рыскания (0-180)
+     * @details Реализует распределение согласно ТЗ:
+     *   - Каналы 0,1: Рули высоты (синхронно, реагируют на com_up)
+     *   - Каналы 2,3: Рули направления (инверсно, реагируют на com_left)
+     *   - Каналы 4,5,6: Крышки/парашют (реагируют на com_up)
+     */
+    void processFlightCommands(uint8_t com_up, uint8_t com_left);
+
+    /**
+     * @brief Проверка подключения PCA9685 по I2C
+     * @return true если устройство отвечает на заданном адресе
+     */
+    bool isChipConnected() const { return _chip_connected; }
+
+    /**
+     * @brief Проверка инициализации контроллера
+     * @return true если begin() был успешно выполнен
+     */
+    bool isInitialized() const { return _initialized; }
+
+    /**
+     * @brief Получение текущего I2C адреса устройства
+     * @return Адрес PCA9685 (0x40 по умолчанию)
+     */
+    uint8_t getI2CAddress() const { return _i2c_address; }
+
+private:
+    static const char* TAG;  ///< Тег для ESP_LOG
+
+    I2CMasterController* _i2c_manager = nullptr;  ///< Указатель на I2C контроллер
+    uint8_t _i2c_address;                           ///< I2C адрес PCA9685
+    uint8_t _servo_channels[7];                     ///< Номера каналов (0-6)
+    int16_t _servo_trim[7] = {0};                   ///< Калибровка для каждого канала
+    bool _initialized = false;                      ///< Флаг успешной инициализации
+    bool _chip_connected = false;                   ///< Флаг подключения по I2C
+
+    // Параметры сервоприводов
+    struct ServoParams {
+        uint16_t frequency = PCA9685_PWM_FREQUENCY;
+        uint16_t min_pulse_us = SERVO_PULSE_MIN_US;
+        uint16_t max_pulse_us = SERVO_PULSE_MAX_US;
+        uint16_t neutral_pulse_us = SERVO_PULSE_NEUTRAL_US;
+    } _servo_params;
+
+    // ========================================================================
+    // Приватные методы
+    // ========================================================================
+
+    /**
+     * @brief Преобразование ширины импульса (мкс) в тики PCA9685
+     * @param pulse_us Ширина импульса в микросекундах
+     * @return Количество тиков (0-4095)
+     */
+    uint16_t _pulseUsToTicks(uint16_t pulse_us) const;
+
+    /**
+     * @brief Преобразование логического угла в ширину импульса
+     * @param logical_angle Угол в градусах (-90...+90)
+     * @return Ширина импульса в микросекундах
+     */
+    uint16_t _logicalAngleToPulseUs(int16_t logical_angle) const;
+
+    /**
+     * @brief Проверка угла на соответствие безопасности
+     * @param angle Угол для проверки
+     * @return Безопасный угол с учётом ограничений
+     */
+    int16_t _validateSafetyAngle(int16_t angle) const;
+
+    /**
+     * @brief Установка PWM тиков напрямую (низкоуровневый метод)
+     * @param channel Номер канала PCA9685 (0-15)
+     * @param on_tick Тик включения (обычно 0)
+     * @param off_tick Тик выключения (0-4095)
+     * @return true при успехе
+     */
+    bool _setPWM(uint8_t channel, uint16_t on_tick, uint16_t off_tick);
+
+    /**
+     * @brief Чтение регистра PCA9685 через I2C
+     */
+    bool _readRegister(uint8_t reg_addr, uint8_t* data, size_t len);
+
+    /**
+     * @brief Запись в регистр PCA9685 через I2C
+     */
+    bool _writeRegister(uint8_t reg_addr, const uint8_t* data, size_t len);
+
+    /**
+     * @brief 🔑 Отладочная печать PWM параметров
+     */
+    void _printPWMDebug(uint8_t servo_index, int16_t angle,
+                       uint16_t pulse_us, uint16_t ticks);
+};
+
+=== Файл: ./modules//pca9685_servo//pca9685_servo.cpp ===
+/**
+ * @file pca9685_servo.cpp
+ * @brief Реализация контроллера сервоприводов через PCA9685
+ * @details
+ * - Адаптирован под ESP32-S3 и нативный I2C драйвер
+ * - Все операции с подробной отладкой через ESP_LOG
+ * - Предстартовый тест: 3 цикла, все каналы одновременно
+ * - Углы безопасности и калибровка каждого канала
+ *
+ * @version 1.0 (миграция из Arduino IDE)
+ * @date 2026-05-26
+ */
+
+#include "pca9685_servo.h"
+#include <cstring>
+#include <cmath>
+
+// ============================================================================
+// Глобальная последовательность теста (определена здесь)
+// ============================================================================
+const int16_t SERVO_TEST_SEQUENCE[] = {0, 30, 60, 0, -30, -60, 0};
+const uint8_t SERVO_TEST_SEQUENCE_SIZE = 7;
+
+// ============================================================================
+// Статический тег для отладки
+// ============================================================================
+const char* PCA9685ServoController::TAG = "PCA9685_SERVO";
+
+// ============================================================================
+// Конструктор
+// ============================================================================
+PCA9685ServoController::PCA9685ServoController(uint8_t i2c_address)
+    : _i2c_address(i2c_address) {
+
+    // Инициализация каналов по умолчанию (0-6)
+    for (uint8_t i = 0; i < 7; i++) {
+        _servo_channels[i] = i;
+    }
+
+    // Инициализация калибровки
+    for (uint8_t i = 0; i < 7; i++) {
+        _servo_trim[i] = 0;
+    }
+
+    _initialized = false;
+    _chip_connected = false;
+
+    ESP_LOGI(TAG, "✅ Конструктор: адрес=0x%02X, каналы=0-6", _i2c_address);
+    ESP_LOGI(TAG, "   Параметры серво: min=%u мкс, neutral=%u мкс, max=%u мкс",
+             _servo_params.min_pulse_us,
+             _servo_params.neutral_pulse_us,
+             _servo_params.max_pulse_us);
+}
+
+// ============================================================================
+// Инициализация (Adafruit-style sequence)
+// ============================================================================
+bool PCA9685ServoController::begin(I2CMasterController& i2c_manager) {
+    ESP_LOGI(TAG, "=== 🚀 ИНИЦИАЛИЗАЦИЯ PCA9685 (7 серво) ===");
+    ESP_LOGI(TAG, "   I2C адрес: 0x%02X, Частота: %u Гц",
+             _i2c_address, _servo_params.frequency);
+    ESP_LOGI(TAG, "   🔑 Диапазон импульсов: %u-%u мкс",
+             _servo_params.min_pulse_us, _servo_params.max_pulse_us);
+
+    _i2c_manager = &i2c_manager;
+
+    // 1. Проверка подключения
+    if (!_i2c_manager->isDeviceConnected(_i2c_address)) {
+        ESP_LOGE(TAG, "❌ PCA9685 не отвечает на 0x%02X", _i2c_address);
+        return false;
+    }
+    _chip_connected = true;
+    ESP_LOGI(TAG, "✅ PCA9685 обнаружен на 0x%02X", _i2c_address);
+
+    // 2. Чтение MODE1 до инициализации
+    uint8_t mode1;
+    if (!_readRegister(PCA9685_MODE1, &mode1, 1)) {
+        ESP_LOGE(TAG, "❌ Не удалось прочитать MODE1");
+        return false;
+    }
+    ESP_LOGI(TAG, "   MODE1 до инициализации: 0x%02X (SLEEP=%d)",
+             mode1, (mode1 & PCA9685_MODE1_SLEEP) ? 1 : 0);
+
+    // 3. Переход в SLEEP режим
+    uint8_t sleep_mode = (mode1 & 0x7F) | PCA9685_MODE1_SLEEP;
+    if (!_writeRegister(PCA9685_MODE1, &sleep_mode, 1)) {
+        ESP_LOGE(TAG, "❌ Не удалось установить SLEEP режим");
+        return false;
+    }
+    ESP_LOGI(TAG, "✅ SLEEP режим установлен");
+    delay(5);
+
+    // 4. Установка prescaler для 50 Гц
+    // prescale = round(osc_clock / (4096 * freq)) - 1
+    const float osc_clock = 25000000.0f;
+    const float target_freq = 50.0f;
+    uint8_t prescale = static_cast<uint8_t>(
+        (osc_clock / (4096.0f * target_freq)) - 1.0f + 0.5f
+    );
+    ESP_LOGI(TAG, "   Prescaler: %u для %.1f Гц", prescale, target_freq);
+
+    if (!_writeRegister(PCA9685_PRESCALE, &prescale, 1)) {
+        ESP_LOGE(TAG, "❌ Не удалось установить prescaler");
+        return false;
+    }
+
+    // 5. Выход из SLEEP + AUTO_INCREMENT
+    uint8_t wake_mode = PCA9685_MODE1_AUTO_INC | PCA9685_MODE1_RESTART;
+    ESP_LOGI(TAG, "   🔑 Запись MODE1=0x%02X (AUTO_INCREMENT=1, SLEEP=0)", wake_mode);
+    if (!_writeRegister(PCA9685_MODE1, &wake_mode, 1)) {
+        ESP_LOGE(TAG, "❌ Не удалось выйти из SLEEP режима");
+        return false;
+    }
+    ESP_LOGI(TAG, "✅ Выход из SLEEP (MODE1=0x%02X)", wake_mode);
+
+    // 6. Настройка MODE2: totem-pole output (ОБЯЗАТЕЛЬНО для серво!)
+    ESP_LOGI(TAG, "⚙️  Настройка MODE2 (режим выхода для серво)...");
+    uint8_t mode2 = PCA9685_MODE2_OUTDRV;  // 0b00000100 = OUTDRV=1
+
+    bool mode2_ok = false;
+    for (uint8_t retry = 0; retry < 3; retry++) {
+        if (_writeRegister(PCA9685_MODE2, &mode2, 1)) {
+            delay(5);
+            uint8_t mode2_verify;
+            if (_readRegister(PCA9685_MODE2, &mode2_verify, 1)) {
+                if ((mode2_verify & PCA9685_MODE2_OUTDRV) == PCA9685_MODE2_OUTDRV) {
+                    mode2_ok = true;
+                    ESP_LOGI(TAG, "   ✅ MODE2 записан успешно (0x%02X)", mode2_verify);
+                    break;
+                }
+            }
+        }
+        delay(10);
+    }
+
+    if (!mode2_ok) {
+        ESP_LOGE(TAG, "❌ КРИТИЧЕСКАЯ ОШИБКА: Не удалось установить MODE2!");
+        ESP_LOGE(TAG, "   Сервоприводы могут вращаться непрерывно!");
+        return false;
+    }
+
+    // 7. Задержка стабилизации осциллятора
+    ESP_LOGI(TAG, "⏳ Стабилизация осциллятора (1500 мс)...");
+    delay(1500);
+
+    // 8. Проверка запуска
+    if (!_readRegister(PCA9685_MODE1, &mode1, 1)) {
+        ESP_LOGE(TAG, "❌ Не удалось прочитать MODE1 для проверки");
+        return false;
+    }
+    if (mode1 & PCA9685_MODE1_SLEEP) {
+        ESP_LOGE(TAG, "❌ Осциллятор НЕ запустился! (SLEEP=1)");
+        return false;
+    }
+    ESP_LOGI(TAG, "✅ Осциллятор стабилизирован");
+
+    // 9. Финализация
+    _initialized = true;
+    resetToNeutral();  // Сброс в нейтраль для безопасности
+
+    ESP_LOGI(TAG, "✅ PCA9685 успешно инициализирован!");
+    return true;
+}
+
+// ============================================================================
+// Преобразования и низкоуровневые методы
+// ============================================================================
+
+uint16_t PCA9685ServoController::_pulseUsToTicks(uint16_t pulse_us) const {
+    // ticks = pulse_us * 4096 / 20000 (период при 50 Гц = 20000 мкс)
+    uint32_t ticks = (static_cast<uint32_t>(pulse_us) * 4096UL) / 20000UL;
+
+    // Ограничение 12 битами
+    if (ticks > 4095) ticks = 4095;
+    if (ticks < 1) ticks = 1;  // 0 = Full Off
+
+    ESP_LOGV(TAG, "_pulseUsToTicks: %u мкс → %u тиков", pulse_us, ticks);
+    return static_cast<uint16_t>(ticks);
+}
+
+uint16_t PCA9685ServoController::_logicalAngleToPulseUs(int16_t logical_angle) const {
+    // Ограничение входного угла
+    if (logical_angle < -90) logical_angle = -90;
+    if (logical_angle > 90) logical_angle = 90;
+
+    // Линейная интерполяция: pulse = neutral + angle * (max - min) / 180
+    int32_t pulse_width = _servo_params.neutral_pulse_us +
+        (static_cast<int32_t>(logical_angle) *
+         (_servo_params.max_pulse_us - _servo_params.min_pulse_us)) / 180;
+
+    // Ограничение физическими пределами
+    if (pulse_width < static_cast<int32_t>(_servo_params.min_pulse_us)) {
+        pulse_width = _servo_params.min_pulse_us;
+    }
+    if (pulse_width > static_cast<int32_t>(_servo_params.max_pulse_us)) {
+        pulse_width = _servo_params.max_pulse_us;
+    }
+
+    ESP_LOGV(TAG, "_logicalAngleToPulseUs: %+d° → %ld мкс",
+             logical_angle, pulse_width);
+    return static_cast<uint16_t>(pulse_width);
+}
+
+int16_t PCA9685ServoController::_validateSafetyAngle(int16_t angle) const {
+    // Ограничение максимального угла
+    if (angle > SERVO_SAFE_MAX_ANGLE) {
+        ESP_LOGV(TAG, "⚠️ Угол %+d° > +%d°, ограничено", angle, SERVO_SAFE_MAX_ANGLE);
+        angle = SERVO_SAFE_MAX_ANGLE;
+    }
+    if (angle < -SERVO_SAFE_MAX_ANGLE) {
+        ESP_LOGV(TAG, "⚠️ Угол %+d° < -%d°, ограничено", angle, -SERVO_SAFE_MAX_ANGLE);
+        angle = -SERVO_SAFE_MAX_ANGLE;
+    }
+
+    // Буферная зона вокруг нейтрали
+    if (angle > 0 && angle < SERVO_NEUTRAL_BUFFER) {
+        angle = SERVO_NEUTRAL_BUFFER;
+    }
+    if (angle < 0 && angle > -SERVO_NEUTRAL_BUFFER) {
+        angle = -SERVO_NEUTRAL_BUFFER;
+    }
+
+    return angle;
+}
+
+bool PCA9685ServoController::_setPWM(uint8_t channel, uint16_t on_tick, uint16_t off_tick) {
+    if (!_initialized || channel > 15) {
+        ESP_LOGE(TAG, "❌ _setPWM: невалидные параметры (ch=%u)", channel);
+        return false;
+    }
+
+    uint8_t reg_base = PCA9685_LED0_ON_L + 4 * channel;
+    uint8_t data[4];
+    data[0] = on_tick & 0xFF;
+    data[1] = (on_tick >> 8) & 0x0F;   // Mask bits 4-7
+    data[2] = off_tick & 0xFF;
+    data[3] = (off_tick >> 8) & 0x0F;  // Mask bits 4-7
+
+    if (!_i2c_manager->writeRegister(_i2c_address, reg_base, data, 4)) {
+        ESP_LOGE(TAG, "❌ Ошибка записи PWM канал %u", channel);
+        return false;
+    }
+
+    ESP_LOGV(TAG, "_setPWM[%u]: on=%u, off=%u", channel, on_tick, off_tick);
+    return true;
+}
+
+bool PCA9685ServoController::_readRegister(uint8_t reg_addr, uint8_t* data, size_t len) {
+    return _i2c_manager->readRegister(_i2c_address, reg_addr, data, len);
+}
+
+bool PCA9685ServoController::_writeRegister(uint8_t reg_addr, const uint8_t* data, size_t len) {
+    return _i2c_manager->writeRegister(_i2c_address, reg_addr, data, len);
+}
+
+// ============================================================================
+// Публичные методы управления
+// ============================================================================
+
+bool PCA9685ServoController::setLogicalAngle(uint8_t servo_index, int16_t angle) {
+    if (!_initialized || servo_index >= 7) {
+        ESP_LOGE(TAG, "❌ setLogicalAngle: невалидные параметры");
+        return false;
+    }
+
+    int16_t safe_angle = _validateSafetyAngle(angle);
+    uint16_t pulse_us = _logicalAngleToPulseUs(safe_angle);
+    pulse_us += _servo_trim[servo_index];
+
+    // Ограничение физическими пределами
+    if (pulse_us < _servo_params.min_pulse_us) pulse_us = _servo_params.min_pulse_us;
+    if (pulse_us > _servo_params.max_pulse_us) pulse_us = _servo_params.max_pulse_us;
+
+    uint16_t ticks = _pulseUsToTicks(pulse_us);
+
+    // 🔑 Отладочная печать
+    _printPWMDebug(servo_index, safe_angle, pulse_us, ticks);
+
+    ESP_LOGV(TAG, "setLogicalAngle[%u]: %+d° → %u мкс → %u тиков",
+             servo_index, safe_angle, pulse_us, ticks);
+
+    return _setPWM(_servo_channels[servo_index], 0, ticks);
+}
+
+bool PCA9685ServoController::setPhysicalAngle(uint8_t servo_index, uint16_t physical_angle) {
+    if (!_initialized || servo_index >= 7) return false;
+    if (physical_angle > 180) physical_angle = 180;
+
+    int16_t logical_angle = static_cast<int16_t>(physical_angle) - 90;
+    return setLogicalAngle(servo_index, logical_angle);
+}
+
+bool PCA9685ServoController::setPulseWidthUs(uint8_t servo_index, uint16_t pulse_us) {
+    if (!_initialized || servo_index >= 7) return false;
+
+    if (pulse_us < _servo_params.min_pulse_us) pulse_us = _servo_params.min_pulse_us;
+    if (pulse_us > _servo_params.max_pulse_us) pulse_us = _servo_params.max_pulse_us;
+
+    uint16_t ticks = _pulseUsToTicks(pulse_us);
+    return _setPWM(servo_index, 0, ticks);
+}
+
+void PCA9685ServoController::setServoTrim(uint8_t servo_index, int16_t trim_us) {
+    if (servo_index < 7) {
+        _servo_trim[servo_index] = trim_us;
+        ESP_LOGI(TAG, "✅ Серво #%u: калибровка = %+d мкс", servo_index, trim_us);
+    }
+}
+
+void PCA9685ServoController::resetToNeutral() {
+    if (!_initialized) {
+        ESP_LOGW(TAG, "⚠️ resetToNeutral: контроллер не инициализирован");
+        return;
+    }
+
+    ESP_LOGI(TAG, "🔄 Сброс всех сервоприводов в нейтраль (1500 мкс)");
+    for (uint8_t i = 0; i < 7; i++) {
+        setLogicalAngle(i, 0);
+        delay(50);  // 🔑 50 мс между каналами (снижает пиковый ток!)
+    }
+    ESP_LOGI(TAG, "✅ Все сервоприводы в нейтрали");
+}
+
+// ============================================================================
+// 🔑 Предстартовый тест сервоприводов
+// ============================================================================
+bool PCA9685ServoController::runServoTest() {
+    if (!_initialized) {
+        ESP_LOGE(TAG, "❌ runServoTest: контроллер не инициализирован!");
+        return false;
+    }
+
+    // ========================================================================
+    // ШАГ 1: Вывод параметров теста
+    // ========================================================================
+    ESP_LOGI(TAG, "==========================================");
+    ESP_LOGI(TAG, "⚙️  ПРЕДСТАРТОВЫЙ ТЕСТ СЕРВОПРИВОДОВ");
+    ESP_LOGI(TAG, "==========================================");
+    ESP_LOGI(TAG, "📊 ПАРАМЕТРЫ:");
+    ESP_LOGI(TAG, "   • PCA9685 адрес: 0x%02X", _i2c_address);
+    ESP_LOGI(TAG, "   • Каналы: 0-6 (7 сервоприводов)");
+    ESP_LOGI(TAG, "   • Частота PWM: %u Гц", _servo_params.frequency);
+    ESP_LOGI(TAG, "   • Импульсы: %u-%u мкс",
+             _servo_params.min_pulse_us, _servo_params.max_pulse_us);
+    ESP_LOGI(TAG, "   • Циклов теста: %d", SERVO_TEST_CYCLES);
+    ESP_LOGI(TAG, "   • Задержка шага: %d мс", SERVO_TEST_STEP_DELAY_MS);
+
+    // Расчётные значения для ключевых углов
+    ESP_LOGI(TAG, "📋 РАСЧЁТНЫЕ ЗНАЧЕНИЯ PWM:");
+    ESP_LOGI(TAG, "   Угол -90°: %u мкс → %u тиков",
+             _servo_params.min_pulse_us, _pulseUsToTicks(_servo_params.min_pulse_us));
+    ESP_LOGI(TAG, "   Угол   0°: %u мкс → %u тиков",
+             _servo_params.neutral_pulse_us, _pulseUsToTicks(_servo_params.neutral_pulse_us));
+    ESP_LOGI(TAG, "   Угол +90°: %u мкс → %u тиков",
+             _servo_params.max_pulse_us, _pulseUsToTicks(_servo_params.max_pulse_us));
+    ESP_LOGI(TAG, "==========================================");
+
+    // ========================================================================
+    // ШАГ 2: Основной цикл теста
+    // ========================================================================
+    for (uint8_t cycle = 0; cycle < SERVO_TEST_CYCLES; cycle++) {
+        ESP_LOGI(TAG, "🔄 ЦИКЛ ТЕСТА №%d из %d", cycle + 1, SERVO_TEST_CYCLES);
+
+        for (uint8_t step = 0; step < SERVO_TEST_SEQUENCE_SIZE; step++) {
+            int16_t target_angle = SERVO_TEST_SEQUENCE[step];
+
+            // Все 7 сервоприводов двигаются ОДНОВРЕМЕННО!
+            for (uint8_t servo_index = 0; servo_index < 7; servo_index++) {
+                setLogicalAngle(servo_index, target_angle);
+            }
+
+            // Отладочный вывод
+            const char* label;
+            if (target_angle == 0) {
+                label = "НЕЙТРАЛЬ";
+            } else if (target_angle > 0) {
+                label = "МАКС+";
+            } else {
+                label = "МАКС-";
+            }
+            ESP_LOGI(TAG, "   📍 Шаг %u: %+3d° [%s] - все 7 серво",
+                     step, target_angle, label);
+
+            delay(SERVO_TEST_STEP_DELAY_MS);
+        }
+
+        if (cycle < SERVO_TEST_CYCLES - 1) {
+            ESP_LOGI(TAG, "⏳ Пауза между циклами: %d мс", SERVO_TEST_PAUSE_MS);
+            delay(SERVO_TEST_PAUSE_MS);
+        }
+    }
+
+    // ========================================================================
+    // ШАГ 3: Финальный сброс
+    // ========================================================================
+    ESP_LOGI(TAG, "🔄 Финальный сброс в нейтраль (0°)...");
+    resetToNeutral();
+    delay(500);
+
+    ESP_LOGI(TAG, "==========================================");
+    ESP_LOGI(TAG, "✅ ТЕСТ СЕРВОПРИВОДОВ ЗАВЕРШЁН УСПЕШНО!");
+    ESP_LOGI(TAG, "==========================================");
+    return true;
+}
+
+// ============================================================================
+// Обработка команд пульта
+// ============================================================================
+void PCA9685ServoController::processFlightCommands(uint8_t com_up, uint8_t com_left) {
+    if (!_initialized) {
+        ESP_LOGW(TAG, "⚠️ processFlightCommands: контроллер не инициализирован");
+        return;
+    }
+
+    // Преобразование 0-180 → логический диапазон -90°...+90°
+    int16_t pitch_angle = map(com_up, 0, 180, 90, -90);
+    int16_t yaw_angle   = map(com_left, 0, 180, 90, -90);
+
+    ESP_LOGD(TAG, "📡 RC Commands: Up=%3d→P=%+3d°, Left=%3d→Y=%+3d°",
+             com_up, pitch_angle, com_left, yaw_angle);
+
+    // 🎯 Каналы 0,1: Рули высоты (синхронно)
+    setLogicalAngle(0, pitch_angle);
+    setLogicalAngle(1, pitch_angle);
+
+    // 🎯 Каналы 2,3: Рули направления (инверсно)
+    setLogicalAngle(2, yaw_angle);
+    setLogicalAngle(3, -yaw_angle);
+
+    // 🎯 Каналы 4,5,6: Вспомогательные серво (парашют, крышки)
+    int16_t hatch_angle = map(com_up, 0, 180, -90, 90);
+    setLogicalAngle(4, hatch_angle);
+    setLogicalAngle(5, hatch_angle);
+    setLogicalAngle(6, hatch_angle);
+}
+
+// ============================================================================
+// Отладочная печать
+// ============================================================================
+void PCA9685ServoController::_printPWMDebug(uint8_t servo_index, int16_t angle,
+                                           uint16_t pulse_us, uint16_t ticks) {
+    ESP_LOGI(TAG, "   🔍 PWM DEBUG: Серво #%u | Угол: %+3d° | Импульс: %u мкс | Тики: %u",
+             servo_index, angle, pulse_us, ticks);
+
+    // Расчёт фактической длительности
+    float actual_us = (ticks * 20000.0f) / 4096.0f;
+    ESP_LOGI(TAG, "   📊 Фактическая длительность: %.1f мкс", actual_us);
+
+    // Проверка расхождения
+    float diff = static_cast<float>(pulse_us) - actual_us;
+    if (fabsf(diff) > 5.0f) {
+        ESP_LOGW(TAG, "   ⚠️ Расхождение: задано %u мкс, фактически %.1f мкс (Δ=%.1f мкс)",
+                 pulse_us, actual_us, diff);
+    }
+
+    // Проверка диапазона
+    if (pulse_us < _servo_params.min_pulse_us ||
+        pulse_us > _servo_params.max_pulse_us) {
+        ESP_LOGW(TAG, "   ⚠️ ВНИМАНИЕ: Импульс вне диапазона %u-%u мкс!",
+                 _servo_params.min_pulse_us, _servo_params.max_pulse_us);
+    }
+}
+
+📁 ПАПКА: modules//telemetry_uart/
+
+=== Файл: ./modules//telemetry_uart//TelemetryUARTBridge.h ===
+/**
+ * @file TelemetryUARTBridge.h
+ * @brief Бинарный мост UART2 для передачи телеметрии на RPi Zero 2W
+ * @version 1.0.0
+ * @date 2026
+ * 
+ * @details
+ * • Формат пакета: [0xAA 0x55][payload 44B][CRC8][0xCC 0x33]
+ * • Частота отправки: 20-50 мс (20-50 Гц)
+ * • Скорость: 921600 бод с аппаратным Flow Control
+ * • Обратный канал: команды RPi → ESP32 (камера/режим)
+ */
+#pragma once
+#ifndef TELEMETRY_UART_BRIDGE_H
+#define TELEMETRY_UART_BRIDGE_H
+
+#include <Arduino.h>
+#include <HardwareSerial.h>
+#include "CommonTypes.h"
+#include "Config.h"
+
+/**
+ * @brief Структура телеметрического пакета (44 байта + заголовок/футер + CRC)
+ */
+#pragma pack(push, 1)
+struct TelemetryPacket_t {
+    // === Управление (из DataComSet_t) ===
+    uint16_t packet_id;           // ID пакета (0-65535)
+    uint32_t timestamp;           // millis() при формировании
+    uint8_t  com_up;              // Команда тангажа (0-255)
+    uint8_t  com_left;            // Команда крена (0-255)
+    uint16_t com_throttle;        // Тяга (1000-2000)
+    uint8_t  com_flags;           // Битовая маска команд
+    
+    // === Стабилизация (из FlightStabilizer) ===
+    float roll;                   // Крен (градусы, -90..+90)
+    float pitch;                  // Тангаж (градусы, -90..+90)
+    float yaw;                    // Рыскание (градусы, 0..360)
+    float altitude;               // Высота (метры)
+    float speed;                  // Скорость (м/с)
+    
+    // === Навигация ===
+    double latitude;              // Широта (градусы)
+    double longitude;             // Долгота (градусы)
+    
+    // === Батарея ===
+    float battery_voltage;        // Напряжение (В)
+    uint8_t battery_percent;      // Заряд (%)
+    
+    // === Сигнал и статус ===
+    int8_t  rssi;                 // RSSI LoRa (dBm)
+    uint8_t flight_mode;          // 1=MANUAL, 2=STAB, 3=FULL
+    uint8_t imu_status;           // Статус IMU (битовая маска)
+    
+    // === CRC8 (вычисляется отдельно, не входит в payload) ===
+    // uint8_t crc8;              // Вычисляется по полю [packet_id..flight_mode]
+};
+#pragma pack(pop)
+
+/**
+ * @brief Структура команд обратного канала RPi → ESP32
+ * @details 0x01: Перезапуск камеры, 0x02: Смена режима полета, 0xFF: Ping
+ */
+enum class RPiCommand : uint8_t {
+    CMD_RESTART_CAM = 0x01,
+    CMD_CHANGE_MODE = 0x02,
+    CMD_HEARTBEAT   = 0xFF
+};
+
+
+constexpr size_t TELEMETRY_PAYLOAD_SIZE = sizeof(TelemetryPacket_t);  // 44 байта
+constexpr uint8_t  UART_HEADER_1 = 0xAA;
+constexpr uint8_t  UART_HEADER_2 = 0x55;
+constexpr uint8_t  UART_FOOTER_1 = 0xCC;
+constexpr uint8_t  UART_FOOTER_2 = 0x33;
+
+/**
+ * @brief Класс управления UART-мостом телеметрии
+ */
+class TelemetryUARTBridge {
+public:
+    /**
+     * @brief Инициализация UART2 с аппаратным Flow Control
+     * @param baudrate Скорость (рекомендуется 921600)
+     * @param tx_pin GPIO для TX (Config::Pins::UART_RPI_TX = 5)
+     * @param rx_pin GPIO для RX (Config::Pins::UART_RPI_RX = 6)
+     * @param rts_pin GPIO для RTS (опционально, -1 = отключено)
+     * @param cts_pin GPIO для CTS (опционально, -1 = отключено)
+     * @return true при успешной инициализации
+     */
+    static bool begin(uint32_t baudrate = 921600, 
+                     uint8_t tx_pin = Config::Pins::UART_RPI_TX,
+                     uint8_t rx_pin = Config::Pins::UART_RPI_RX,
+                     int8_t rts_pin = -1, int8_t cts_pin = -1);
+    
+    /**
+     * @brief Отправка телеметрического пакета (неблокирующая)
+     * @param pkt Ссылка на структуру телеметрии
+     * @return true если пакет поставлен в очередь отправки
+     */
+    static bool sendTelemetry(const TelemetryPacket_t& pkt);
+    
+    /**
+     * @brief Проверка наличия входящих команд от RPi
+     * @param cmd[out] Буфер для команды (если есть)
+     * @return true если команда получена
+     */
+    static bool checkCommand(uint8_t& cmd);
+    
+    /**
+     * @brief Статический расчёт CRC8 (Poly 0x07, Init 0x00)
+     * @param data Указатель на данные
+     * @param length Длина данных
+     * @return Вычисленный CRC8
+     */
+    static uint8_t calculateCRC8(const uint8_t* data, size_t length);
+    
+    /**
+     * @brief Получение статистики отправки
+     */
+    static void getStats(uint32_t& sent, uint32_t& errors, float& avg_latency_ms);
+
+    /**
+    * @brief Проверка состояния инициализации UART-моста
+    * @return true если UART2 успешно настроен и готов к работе
+    * @note Статический метод — вызывается без экземпляра класса
+    */
+    static bool isInitialized() { return _initialized; }  // ← inline-реализация
+    
+    /**
+     * @brief Неблокирующая обработка входящих команд от RPi
+     * @param handler Лямбда или указатель на функцию обработки команды
+     */
+    static void processRPiCommands(void (*handler)(RPiCommand cmd));
+   
+
+private:
+    static HardwareSerial* _uart;
+    static bool _initialized;
+    static uint32_t _packets_sent;
+    static uint32_t _send_errors;
+    static uint64_t _total_latency_us;
+    
+    /**
+     * @brief Внутренняя отправка с фреймингом и CRC
+     */
+    static bool _sendRaw(const uint8_t* payload, size_t length);
+};
+
+#endif // TELEMETRY_UART_BRIDGE_H
+
+=== Файл: ./modules//telemetry_uart//TelemetryUARTBridge.cpp ===
+
+/**
+ * @file TelemetryUARTBridge.cpp
+ * @brief Реализация бинарного моста UART2 для телеметрии
+ * @details
+ * • Алгоритм отправки:
+ *   1. Формирование payload (44 байта)
+ *   2. Расчёт CRC8 по payload
+ *   3. Добавление фрейминга: [0xAA 0x55][payload][CRC8][0xCC 0x33]
+ *   4. Отправка через HardwareSerial с проверкой доступности буфера
+ * 
+ * • Алгоритм приёма команд:
+ *   1. Проверка available()
+ *   2. Поиск заголовка 0xAA 0x55
+ *   3. Чтение payload + CRC + футера
+ *   4. Валидация CRC и футера
+ *   5. Обработка команды
+ * 
+ * @note Все операции неблокирующие для работы в loop()
+ */
+#include "TelemetryUARTBridge.h"
+#include "esp_log.h"
+#include <cstring>
+
+static const char* TAG = "UART_TELEM";
+
+HardwareSerial* TelemetryUARTBridge::_uart = nullptr;
+bool TelemetryUARTBridge::_initialized = false;
+uint32_t TelemetryUARTBridge::_packets_sent = 0;
+uint32_t TelemetryUARTBridge::_send_errors = 0;
+uint64_t TelemetryUARTBridge::_total_latency_us = 0;
+
+// ============================================================================
+// 🔧 CRC8 CALCULATION (Poly 0x07, Init 0x00) — идентично LoRaCommunicator.cpp
+// ============================================================================
+uint8_t TelemetryUARTBridge::calculateCRC8(const uint8_t* data, size_t length) {
+    // 🔑 Таблица CRC8 (Poly 0x07) — та же, что в LoRaCommunicator.cpp
+    static const uint8_t CRC8_TABLE[256] = {
+        0x00, 0x07, 0x0E, 0x09, 0x1C, 0x1B, 0x12, 0x15, 0x38, 0x3F, 0x36, 0x31, 0x24, 0x23, 0x2A, 0x2D,
+        // ... (полная таблица из LoRaCommunicator.cpp)
+        0xDE, 0xD9, 0xD0, 0xD7, 0xC2, 0xC5, 0xCC, 0xCB, 0xE6, 0xE1, 0xE8, 0xEF, 0xFA, 0xFD, 0xF4, 0xF3
+    };
+    
+    uint8_t crc = 0x00;
+    for (size_t i = 0; i < length; i++) {
+        crc = CRC8_TABLE[crc ^ data[i]];
+    }
+    return crc;
+}
+
+// ============================================================================
+// 🔧 ИНИЦИАЛИЗАЦИЯ UART2 С FLOW CONTROL
+// ============================================================================
+bool TelemetryUARTBridge::begin(uint32_t baudrate, uint8_t tx_pin, uint8_t rx_pin, 
+                                int8_t rts_pin, int8_t cts_pin) {
+    if (_initialized) {
+        ESP_LOGW(TAG, "⚠️ UART уже инициализирован");
+        return true;
+    }
+    
+    ESP_LOGI(TAG, "🚀 Инициализация UART2: %d бод, TX=%d, RX=%d", 
+             baudrate, tx_pin, rx_pin);
+    
+    ESP_LOGI(TAG, "🚀 Инициализация UART2: %d бод | TX=%d, RX=%d | RTS=%d, CTS=%d",
+             baudrate, tx_pin, rx_pin, rts_pin, cts_pin);
+
+    // 🔑 Создаём объект HardwareSerial для UART2 (UART_NUM_2 на ESP32-S3)
+    _uart = new HardwareSerial(2);  // UART2
+    
+    // 🔑 ВКЛЮЧЕНИЕ АППАРАТНОГО FLOW CONTROL
+    // 5-й параметр (true) включает RTS/CTS. Пины передаются напрямую.
+    _uart->begin(baudrate, SERIAL_8N1, rx_pin, tx_pin, true, 
+                 static_cast<gpio_num_t>(rts_pin), 
+                 static_cast<gpio_num_t>(cts_pin));
+
+    _uart->setRxBufferSize(4096);  // Увеличен для пиков видеопотока
+    _uart->setTxBufferSize(4096);
+    delay(10);  // 🔧 Задержка для стабилизации
+
+    // 🔧 Диагностика состояния линий RTS/CTS при старте
+    ESP_LOGD(TAG, "📊 Состояние Flow Control: RTS(GPIO%d)=%s, CTS(GPIO%d)=%s",
+             rts_pin, digitalRead(rts_pin) ? "HIGH" : "LOW",
+             cts_pin, digitalRead(cts_pin) ? "HIGH" : "LOW");
+
+            //                    // 🔧 Настройка пинов с аппаратным Flow Control (если заданы)
+            //                    if (rts_pin >= 0 && cts_pin >= 0) {
+            //                        ESP_LOGI(TAG, "✅ Flow Control: RTS=%d, CTS=%d", rts_pin, cts_pin);
+            //                        _uart->begin(baudrate, SERIAL_8N1, rx_pin, tx_pin, true, 
+            //                                    static_cast<gpio_num_t>(rts_pin), 
+            //                                    static_cast<gpio_num_t>(cts_pin));
+            //                    } else {
+            //                        ESP_LOGW(TAG, "⚠️ Flow Control отключён (рекомендуется для 921600 бод!)");
+            //                        _uart->begin(baudrate, SERIAL_8N1, rx_pin, tx_pin);
+            //                    }
+                                
+            //                    // 🔧 Настройка буферов для высокой скорости
+            //                    _uart->setRxBufferSize(2048);  // Увеличенный буфер приёма
+            //                    _uart->setTxBufferSize(2048);  // Увеличенный буфер передачи
+                                
+                                    // 🔧 Задержка для стабилизации
+                                    //delay(10);
+    
+    // 🔧 Проверка связи (опционально)
+    if (_uart->available()) {
+        ESP_LOGI(TAG, "✅ UART2 готов, в буфере: %d байт", _uart->available());
+    }
+    
+    _initialized = true;
+    ESP_LOGI(TAG, "✅ UART2 инициализирован успешно");
+    return true;
+}
+
+// ============================================================================
+// 🔧 ОТПРАВКА ТЕЛЕМЕТРИИ (с фреймингом и CRC)
+// ============================================================================
+bool TelemetryUARTBridge::sendTelemetry(const TelemetryPacket_t& pkt) {
+    if (!_initialized || !_uart) {
+        ESP_LOGE(TAG, "❌ sendTelemetry: UART не инициализирован");
+        return false;
+    }
+    
+    // 🔑 1. Подготовка буфера: [header][payload][crc][footer]
+    uint8_t frame[2 + TELEMETRY_PAYLOAD_SIZE + 1 + 2];  // 2+44+1+2 = 49 байт
+    size_t idx = 0;
+    
+    // Заголовок
+    frame[idx++] = UART_HEADER_1;  // 0xAA
+    frame[idx++] = UART_HEADER_2;  // 0x55
+    
+    // Payload (копирование структуры)
+    memcpy(&frame[idx], &pkt, TELEMETRY_PAYLOAD_SIZE);
+    idx += TELEMETRY_PAYLOAD_SIZE;
+    
+    // CRC8 (по payload, без заголовка/футера)
+    frame[idx++] = calculateCRC8(&frame[2], TELEMETRY_PAYLOAD_SIZE);
+    
+    // Футер
+    frame[idx++] = UART_FOOTER_1;  // 0xCC
+    frame[idx++] = UART_FOOTER_2;  // 0x33
+    
+    // 🔑 2. Отправка (неблокирующая с проверкой буфера)
+    return _sendRaw(frame, idx);
+}
+
+// ============================================================================
+// 🔧 ВНУТРЕННЯЯ ОТПРАВКА С ПРОВЕРКОЙ БУФЕРА
+// ============================================================================
+bool TelemetryUARTBridge::_sendRaw(const uint8_t* payload, size_t length) {
+    // 🔧 Проверка доступности места в буфере передачи
+    if (_uart->availableForWrite() < static_cast<int>(length)) {
+        ESP_LOGV(TAG, "⏳ Буфер TX занят (%d/%d свободных)", 
+                 _uart->availableForWrite(), length);
+        _send_errors++;
+        return false;  // Не блокируем, просто пропускаем кадр
+    }
+    
+    // 🔧 Замер времени для статистики
+    uint32_t start_us = micros();
+    
+    // 🔧 Отправка
+    size_t written = _uart->write(payload, length);
+    _uart->flush();  // 🔑 Дождаться отправки (важно для надёжности!)
+    
+    // 🔧 Статистика
+    uint32_t latency_us = micros() - start_us;
+    _total_latency_us += latency_us;
+    
+    if (written == length) {
+        _packets_sent++;
+        ESP_LOGV(TAG, "✅ Отправлено %d байт за %d мкс", written, latency_us);
+        return true;
+    } else {
+        ESP_LOGE(TAG, "❌ Ошибка отправки: %d/%d байт", written, length);
+        _send_errors++;
+        return false;
+    }
+}
+
+// ============================================================================
+// 🔧 ПРОВЕРКА ВХОДЯЩИХ КОМАНД (обратный канал)
+// ============================================================================
+bool TelemetryUARTBridge::checkCommand(uint8_t& cmd) {
+    if (!_initialized || !_uart) return false;
+    
+    // 🔧 Быстрая проверка наличия данных
+    if (_uart->available() < 4) return false;  // Мин. размер команды: [hdr][cmd][crc][ftr]
+    
+    // 🔧 Поиск заголовка (простой алгоритм, можно оптимизировать)
+    while (_uart->available() >= 2) {
+        uint8_t h1 = _uart->read();
+        uint8_t h2 = _uart->peek();  // Смотрим следующий байт без удаления
+        
+        if (h1 == UART_HEADER_1 && h2 == UART_HEADER_2) {
+            _uart->read();  // Прочитать второй байт заголовка
+            
+            // 🔧 Чтение payload (1 байт команды + 1 байт CRC + 2 байта футера)
+            if (_uart->available() >= 4) {
+                uint8_t command = _uart->read();
+                uint8_t crc_recv = _uart->read();
+                uint8_t f1 = _uart->read();
+                uint8_t f2 = _uart->read();
+                
+                // 🔧 Валидация футера
+                if (f1 != UART_FOOTER_1 || f2 != UART_FOOTER_2) {
+                    ESP_LOGW(TAG, "⚠️ Ошибка футера: 0x%02X 0x%02X", f1, f2);
+                    continue;  // Пропустить битый пакет
+                }
+                
+                // 🔧 Валидация CRC
+                uint8_t crc_calc = calculateCRC8(&command, 1);
+                if (crc_calc != crc_recv) {
+                    ESP_LOGW(TAG, "⚠️ CRC mismatch: recv=0x%02X, calc=0x%02X", 
+                             crc_recv, crc_calc);
+                    continue;
+                }
+                
+                // ✅ Команда валидна
+                cmd = command;
+                ESP_LOGD(TAG, "✅ Команда получена: 0x%02X", command);
+                return true;
+            }
+        }
+    }
+    
+    return false;
+}
+
+// ============================================================================
+// 🔧 СТАТИСТИКА
+// ============================================================================
+void TelemetryUARTBridge::getStats(uint32_t& sent, uint32_t& errors, float& avg_latency_ms) {
+    sent = _packets_sent;
+    errors = _send_errors;
+    avg_latency_ms = (_packets_sent > 0) 
+        ? (_total_latency_us / _packets_sent) / 1000.0f 
+        : 0.0f;
+}
+
+// ============================================================================
+// 🔧 СТАТИСТИКА
+// ============================================================================
+void TelemetryUARTBridge::processRPiCommands(void (*handler)(RPiCommand cmd)) {
+    uint8_t cmdByte;
+    // Используем существующий checkCommand() для валидации CRC/футера
+    while (checkCommand(cmdByte)) {
+        if (handler != nullptr) {
+            ESP_LOGI(TAG, "📥 RPi команда: 0x%02X", cmdByte);
+            handler(static_cast<RPiCommand>(cmdByte));
+        }
+    }
+}
+
+
+📁 ПАПКА: modules//unified_ledc/
+
+=== Файл: ./modules//unified_ledc//unified_ledc.h ===
+
+/**
+ * @file unified_ledc.h
+ * @brief Контроллер управления силовыми моторами через аппаратный ШИМ LEDC ESP32-S3
+ * @details
+ * - Использует аппаратный ШИМ LEDC для генерации PWM 1 кГц
+ * - Поддерживает 2 независимых мотора (GPIO 16, 21)
+ * - Разрешение 10 бит (0-1023 градации мощности)
+ * - Встроенная защита: ограничение тестовой мощности, проверка диапазонов, graceful degradation
+ *
+ * @environment ESP32-S3 | PlatformIO | Arduino Framework | ESP-IDF 5.0+
+ * @version 2.0.0 (ШАГ 5: Миграция LEDC)
+ * @date 2026-05-28
+ */
+#pragma once
+
+#include <Arduino.h>
+#include <driver/ledc.h>
+#include "esp_err.h"
+#include "common/types.h"
+
+class UnifiedLEDCController {
+private:
+    bool _initialized = false;
+    const char* _lastError = "No error";
+
+    // 🔑 КОНФИГУРАЦИЯ ПИНОВ И КАНАЛОВ (ESP32-S3)
+    static constexpr uint8_t _motorPins[2]   = {16, 21};                 // GPIO16, GPIO21
+    static constexpr ledc_channel_t _channels[2] = {LEDC_CHANNEL_1, LEDC_CHANNEL_2};
+    static constexpr uint32_t _freqHz        = 1000;                     // Частота PWM для моторов
+    static constexpr uint32_t _dutyResolution = 10;                      // 10 бит (0-1023)
+
+    esp_err_t setupTimer();
+    esp_err_t setupChannel(uint8_t index);
+
+public:
+    UnifiedLEDCController();
+
+    /** @brief Инициализация LEDC таймера и каналов */
+    bool begin();
+
+    /** @brief Установка мощности мотора (0.0 - 100.0%) */
+    bool setMotorPower(uint8_t motorIndex, float powerPercent);
+
+    /** @brief Мгновенная остановка всех моторов */
+    void stopAllMotors();
+
+    /** @brief Безопасный предстартовый тест с ограничением мощности */
+    bool runStartupDiagnostic(float maxPowerPercent = 30.0f, uint32_t durationMs = 2000);
+
+    /** @brief Проверка статуса инициализации */
+    bool isInitialized() const { return _initialized; }
+
+    /** @brief Получение текста последней ошибки */
+    const char* getLastError() const { return _lastError; }
+};
+
+=== Файл: ./modules//unified_ledc//unified_ledc.cpp ===
+
+//### 📁 2. `modules/unified_ledc/unified_ledc.cpp`
+//*Реализация с пошаговой диагностикой `ESP_LOG`, обработкой ошибок ESP-IDF и защитой от переполнения.*
+//
+//```cpp
+/**
+ * @file unified_ledc.cpp
+ * @brief Реализация контроллера моторов через LEDC ESP32-S3
+ * @details Содержит логику инициализации аппаратного ШИМ, расчёта duty-cycle и безопасных тестов.
+ */
+#include "unified_ledc.h"
+
+static const char* TAG = "LEDC_CTRL";
+
+UnifiedLEDCController::UnifiedLEDCController() {
+    ESP_LOGD(TAG, "🔧 Конструктор UnifiedLEDCController создан");
+}
+
+bool UnifiedLEDCController::begin() {
+    if (_initialized) {
+        ESP_LOGW(TAG, "⚠️ LEDC уже инициализирован. Повторный вызов пропущен.");
+        return true;
+    }
+
+    ESP_LOGI(TAG, "⚙️ Инициализация LEDC для 2 моторов...");
+    ESP_LOGI(TAG, "   📍 Пины: M0→GPIO%d, M1→GPIO%d", _motorPins[0], _motorPins[1]);
+    ESP_LOGI(TAG, "   ⚡ Частота: %lu Гц | Разрешение: %lu бит", _freqHz, _dutyResolution);
+
+    // 1️⃣ Настройка таймера
+    esp_err_t err = setupTimer();
+    if (err != ESP_OK) {
+        _lastError = esp_err_to_name(err);
+        ESP_LOGE(TAG, "❌ Настройка таймера LEDC не удалась: %s", _lastError);
+        return false;
+    }
+    ESP_LOGD(TAG, "✅ Таймер LEDC настроен");
+
+    // 2️⃣ Настройка каналов
+    for (int i = 0; i < 2; i++) {
+        err = setupChannel(i);
+        if (err != ESP_OK) {
+            _lastError = esp_err_to_name(err);
+            ESP_LOGE(TAG, "❌ Настройка канала %d не удалась: %s", i, _lastError);
+            stopAllMotors(); // Сброс в безопасное состояние
+            return false;
+        }
+    }
+
+    _initialized = true;
+    ESP_LOGI(TAG, "✅ LEDC успешно инициализирован. Моторы в режиме STOP (0%)");
+    return true;
+}
+
+bool UnifiedLEDCController::setMotorPower(uint8_t motorIndex, float powerPercent) {
+    if (!_initialized) {
+        ESP_LOGE(TAG, "❌ setMotorPower: контроллер не инициализирован!");
+        return false;
+    }
+    if (motorIndex >= 2) {
+        ESP_LOGE(TAG, "❌ setMotorPower: неверный индекс %u (допустимо 0-1)", motorIndex);
+        return false;
+    }
+
+    // 🔒 Ограничение диапазона 0-100%
+    powerPercent = constrain(powerPercent, 0.0f, 100.0f);
+
+    // 📐 Преобразование % → 10-битное значение (0-1023)
+    uint32_t duty = static_cast<uint32_t>((powerPercent * 1023.0f) / 100.0f);
+
+    esp_err_t err = ledc_set_duty(LEDC_LOW_SPEED_MODE, _channels[motorIndex], duty);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "❌ ledc_set_duty для мотора %u: %s", motorIndex, esp_err_to_name(err));
+        return false;
+    }
+
+    err = ledc_update_duty(LEDC_LOW_SPEED_MODE, _channels[motorIndex]);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "❌ ledc_update_duty для мотора %u: %s", motorIndex, esp_err_to_name(err));
+        return false;
+    }
+
+    ESP_LOGD(TAG, "🔋 Motor #%u: %.1f%% → duty=%lu/1023", motorIndex, powerPercent, duty);
+    return true;
+}
+
+void UnifiedLEDCController::stopAllMotors() {
+    if (!_initialized) return;
+    ESP_LOGW(TAG, "🛑 Аварийная остановка всех моторов!");
+    setMotorPower(0, 0.0f);
+    setMotorPower(1, 0.0f);
+}
+
+bool UnifiedLEDCController::runStartupDiagnostic(float maxPowerPercent, uint32_t durationMs) {
+    if (!_initialized) return false;
+
+    // 🔒 Аппаратный ограничитель безопасности (не более 35%)
+    maxPowerPercent = constrain(maxPowerPercent, 0.0f, 35.0f);
+
+    ESP_LOGI(TAG, "🧪 Запуск предстартового теста моторов (MAX: %.1f%%)", maxPowerPercent);
+    ESP_LOGW(TAG, "⚠️ Убедитесь, что БПЛА закреплён и винты свободны!");
+    delay(2000); // Задержка для осознания оператора
+
+    auto rampMotor = [this](uint8_t idx, float limit) {
+        ESP_LOGD(TAG, "   Разгон M%d: 0%% → %.1f%%", idx, limit);
+        for (int p = 0; p <= (int)limit; p += 5) { setMotorPower(idx, p); delay(40); }
+        ESP_LOGD(TAG, "   Торможение M%d: %.1f%% → 0%%", idx, limit);
+        for (int p = (int)limit; p >= 0; p -= 5) { setMotorPower(idx, p); delay(40); }
+    };
+
+    rampMotor(0, maxPowerPercent);
+    rampMotor(1, maxPowerPercent);
+
+    ESP_LOGI(TAG, "✅ Тест моторов завершён. Все моторы остановлены.");
+    stopAllMotors();
+    return true;
+}
+
+// 🔧 Внутренние методы настройки LEDC
+esp_err_t UnifiedLEDCController::setupTimer() {
+    ledc_timer_config_t timer_conf = {};
+    timer_conf.speed_mode      = LEDC_LOW_SPEED_MODE;
+    timer_conf.timer_num       = LEDC_TIMER_0;
+    timer_conf.duty_resolution = static_cast<ledc_timer_bit_t>(_dutyResolution);
+    timer_conf.freq_hz         = _freqHz;
+    timer_conf.clk_cfg         = LEDC_AUTO_CLK;
+    return ledc_timer_config(&timer_conf);
+}
+
+esp_err_t UnifiedLEDCController::setupChannel(uint8_t index) {
+    ledc_channel_config_t ch_conf = {};
+    ch_conf.gpio_num     = _motorPins[index];
+    ch_conf.speed_mode   = LEDC_LOW_SPEED_MODE;
+    ch_conf.channel      = _channels[index];
+    ch_conf.timer_sel    = LEDC_TIMER_0;
+    ch_conf.duty         = 0; // Старт с 0%
+    ch_conf.hpoint       = 0;
+    esp_err_t err = ledc_channel_config(&ch_conf);
+    if (err == ESP_OK) ledc_set_duty(LEDC_LOW_SPEED_MODE, _channels[index], 0);
+    return err;
+}
+
+📁 ПАПКА: modules//vibration/
+
+=== Файл: ./modules//vibration//VibrationEstimator.h ===
+
+// ### 📄 1. `VibrationEstimator.h` / `.cpp` (Оценка вибраций)
+// **Принцип:** Вибрация проявляется как высокочастотные отклонения модуля 
+//  вектора ускорения от `1g`. Используем **экспоненциальное скользящее 
+// среднее (EMA)** для O(1) вычислений без буферов.
+// 
+// **`VibrationEstimator.h`**
+
+#pragma once
+#include <Arduino.h>
+
+class VibrationEstimator {
+public:
+    VibrationEstimator();
+    
+    // Расчёт нормализованного уровня вибраций [0.0 - 1.0+]
+    // 0.0 = идеально гладко, 1.0 = сильные вибрации
+    float compute(float ax, float ay, float az);
+    
+    // Настройка чувствительности (вызывать 1 раз в setup)
+    void configure(float alphaMag = 0.15f, float alphaVib = 0.05f, float normG = 1.5f);
+    
+    // Получить сырое значение ускорения (для отладки)
+    float getRawMagnitude() const { return _filteredMag; }
+    float getVibrationLevel() const { return _vibration; }
+
+private:
+    float _filteredMag;   // Сглаженный модуль ускорения
+    float _vibration;     // Сглаженный уровень "дрожания"
+    float _alphaMag;      // Коэф. сглаживания модуля (быстрее)
+    float _alphaVib;      // Коэф. сглаживания вибрации (медленнее)
+    float _normG;         // Нормализующий коэффициент (макс. допустимая вибрация)
+};
+
+=== Файл: ./modules//vibration//VibrationLogger.h ===
+
+
+//### 📁 1. Модуль логирования `VibrationLogger.h` / `.cpp`
+// Этот модуль отвечает за вывод в консоль и запись на SD карту.
+// Оптимизация:  Логирование на карту происходит не каждый 
+// тик (это убило бы производительность), а  каждые 500 мс , 
+// записывая усредненные данные.
+
+// VibrationLogger.h 
+// cpp
+//
+#pragma once
+#include <Arduino.h>
+#include <SD.h>
+#include <FS.h>
+
+class VibrationLogger {
+public:
+    VibrationLogger();
+    
+    // Инициализация (вызывать в setup)
+    bool begin(const char* filename = "/vib_log.csv");
+    
+    // Вызывать часто (например, в updateSensors)
+    void recordSample(float vibrationLevel, const char* filterName, float currentKp);
+    
+    // Вызывать периодически (например, раз в 500мс) для сброса на SD
+    void flushToSD();
+    
+    void enableLogging(bool enable);
+
+private:
+    File _file;
+    bool _enabled;
+    bool _sdReady;
+    
+    // Буфер для усреднения
+    float _sumVib;
+    float _maxVib;
+    uint32_t _sampleCount;
+    uint32_t _lastFlushTime;
+    
+    void writeHeader();
+};
+
+
+
+=== Файл: ./modules//vibration//VibrationEstimator.cpp ===
+
+
+// **`VibrationEstimator.cpp`**
+// 
+// 
+#include "modules/vibration/VibrationEstimator.h"
+// #include "VibrationEstimator.h"
+#include <math.h>
+#pragma GCC optimize("O3") // Агрессивная оптимизация + FPU
+
+VibrationEstimator::VibrationEstimator() 
+    : _filteredMag(1.0f), _vibration(0.0f), 
+      _alphaMag(0.15f), _alphaVib(0.05f), _normG(1.5f) {}
+
+void VibrationEstimator::configure(float alphaMag, float alphaVib, float normG) {
+    _alphaMag = fmaxf(0.01f, fminf(alphaMag, 0.99f));
+    _alphaVib = fmaxf(0.005f, fminf(alphaVib, 0.5f));
+    _normG = fmaxf(0.5f, normG);
+}
+
+float VibrationEstimator::compute(float ax, float ay, float az) {
+    // 1. Модуль вектора ускорения (FPU: sqrtf)
+    float mag = sqrtf(ax*ax + ay*ay + az*az);
+    
+    // 2. НЧ-фильтр модуля (отсекает вибрации >~20Hz)
+    _filteredMag = _filteredMag * (1.0f - _alphaMag) + mag * _alphaMag;
+    
+    // 3. "Дрожание" = отклонение от сглаженного значения
+    float jitter = fabsf(mag - _filteredMag);
+    
+    // 4. НЧ-фильтр вибрации (интегрирует энергию вибраций ~5Hz)
+    _vibration = _vibration * (1.0f - _alphaVib) + jitter * _alphaVib;
+    
+    // 5. Нормализация в [0.0 ... 1.0+]
+    return fminf(_vibration / _normG, 1.0f);
+}
+
+=== Файл: ./modules//vibration//VibrationLogger.cpp ===
+
+
+
+// VibrationLogger.cpp 
+// cpp
+// 
+
+#include "VibrationLogger.h"
+#include <esp_log.h>
+
+VibrationLogger::VibrationLogger() 
+    : _enabled(false), _sdReady(false), _sumVib(0), _maxVib(0), _sampleCount(0), _lastFlushTime(0) {}
+
+bool VibrationLogger::begin(const char* filename) {
+    if (!SD.begin()) { // Используйте свой CS пин, если нужно: SD.begin(CS_PIN)
+        ESP_LOGW("SD_LOG", "⚠️ SD Card failed, logging to Serial only.");
+        _sdReady = false;
+    } else {
+        _sdReady = true;
+        // Создаем/открываем файл для дозаписи
+        _file = SD.open(filename, FILE_APPEND);
+        if (!_file) {
+            ESP_LOGE("SD_LOG", "❌ Failed to open %s", filename);
+            _sdReady = false;
+        } else {
+            writeHeader();
+            ESP_LOGI("SD_LOG", "✅ SD Logging started: %s", filename);
+        }
+    }
+    _enabled = true;
+    _lastFlushTime = millis();
+    return true;
+}
+
+void VibrationLogger::enableLogging(bool enable) {
+    _enabled = enable;
+}
+
+void VibrationLogger::recordSample(float vibrationLevel, const char* filterName, float currentKp) {
+    if (!_enabled) return;
+    
+    // Усреднение
+    _sumVib += vibrationLevel;
+    if (vibrationLevel > _maxVib) _maxVib = vibrationLevel;
+    _sampleCount++;
+    
+    // Вывод в монитор порта (всегда, если enabled)
+    ESP_LOGI("VIB_MON", "📊 Vib: %.3f | Filter: %s | PID_Kp: %.2f", vibrationLevel, filterName, currentKp);
+}
+
+void VibrationLogger::flushToSD() {
+    if (!_enabled || !_sdReady || _sampleCount == 0) return;
+    
+    // Запись только если прошло > 500 мс
+    if (millis() - _lastFlushTime < 500) return;
+
+    float avgVib = _sumVib / _sampleCount;
+    _file.printf("%lu, %.4f, %.4f, %s, %.2f\n", 
+                 millis(), avgVib, _maxVib, "Filter", 0.0); // Здесь можно передать имя фильтра
+    
+    _file.flush(); // Гарантируем запись на диск
+    
+    // Сброс буфера
+    _sumVib = 0;
+    _maxVib = 0;
+    _sampleCount = 0;
+    _lastFlushTime = millis();
+}
+
+void VibrationLogger::writeHeader() {
+    _file.println("timestamp_ms, avg_vibration, max_vibration, active_filter, pid_kp");
+    _file.flush();
+}
+
+📁 ПАПКА: result_set/
