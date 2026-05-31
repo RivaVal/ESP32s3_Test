@@ -20,9 +20,9 @@
 #include <esp_log.h>
 #include <cstdint>
 
-#include "../../config/pins.h"
-#include "../../common/types.h"
-#include "../i2c_master/i2c_master.h"
+#include "config/pins.h"
+#include "common/types.h"
+#include "modules/i2c_master/i2c_master.h"
 
 // ============================================================================
 // Регистры PCA9685 (совместимость с Adafruit)

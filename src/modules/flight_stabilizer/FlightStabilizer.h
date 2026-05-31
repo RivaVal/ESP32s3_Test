@@ -22,26 +22,57 @@
 // Локальные заголовки проекта
 #include "common/types.h"
 #include "config/pins.h"
-#include "modules/imu_handler/mpu9250_handler.h"
+// #include "modules/imu_handler/mpu9250_handler.h"
+#include "modules/imu_handler/MPU9250_Handler.h"  // ← Обратите внимание на регистр!
 #include "modules/pca9685_servo/pca9685_servo.h"
+
+
 
 /**
  * @brief Конфигурация ПИД-регулятора с адаптивными параметрами
  */
 struct PIDConfig {
-    float kp = 2.0f;              ///< Пропорциональный коэффициент
-    float ki = 0.0f;              ///< Интегральный коэффициент
-    float kd = 0.5f;              ///< Дифференциальный коэффициент
-    float maxIntegral = 10.0f;    ///< Ограничение интеграла (anti-windup)
-    float maxOutput = 30.0f;      ///< Макс. выход (градусы)
-    float dFilterAlpha = 0.2f;    ///< Коэф. фильтра производной (0.0-1.0)
+    float kp = 2.0f;
+    float ki = 0.0f;
+    float kd = 0.5f;
+    float maxIntegral = 10.0f;
+    float maxOutput = 30.0f;
+    float dFilterAlpha = 0.2f;
 
-    // 🔑 Адаптивные параметры (заполняются автоматически)
-    float baseKp = 2.0f;          ///< Базовое Kp для восстановления
-    float baseKi = 0.0f;          ///< Базовое Ki
-    float baseKd = 0.5f;          ///< Базовое Kd
+    // ✅ ДОБАВИТЬ конструктор по умолчанию:
+    PIDConfig() = default;
+
+    // Конструктор с параметрами (опционально)
+    PIDConfig(float p, float i, float d, float mi, float mo, float df)
+        : kp(p), ki(i), kd(d), maxIntegral(mi), maxOutput(mo), dFilterAlpha(df) {}
 };
 
+        //        struct PIDConfig {
+        //            float kp = 2.0f;              ///< Пропорциональный коэффициент
+        //            float ki = 0.0f;              ///< Интегральный коэффициент
+        //            float kd = 0.5f;              ///< Дифференциальный коэффициент
+         ///           float maxIntegral = 10.0f;    ///< Ограничение интеграла (anti-windup)
+        //            float maxOutput = 30.0f;      ///< Макс. выход (градусы)
+        //            float dFilterAlpha = 0.2f;    ///< Коэф. фильтра производной (0.0-1.0)
+//
+        //            // 🔑 Адаптивные параметры (заполняются автоматически)
+        //            float baseKp = 2.0f;          ///< Базовое Kp для восстановления
+        //            float baseKi = 0.0f;          ///< Базовое Ki
+        //            float baseKd = 0.5f;          ///< Базовое Kd
+
+        //            PIDConfig(float p, float i, float d, float mi, float mo, float df) 
+        //                : kp(p), ki(i), kd(d), maxIntegral(mi), maxOutput(mo), dFilterAlpha(df) {}
+
+        //        };
+
+        //        struct PIDConfig {
+        //            float kp = 2.0f, ki = 0.0f, kd = 0.5f;
+        //            float maxIntegral = 10.0f, maxOutput = 30.0f, dFilterAlpha = 0.2f;
+                    
+        //            // 🔧 Добавьте конструктор:
+        //            PIDConfig(float p, float i, float d, float mi, float mo, float df) 
+        //                : kp(p), ki(i), kd(d), maxIntegral(mi), maxOutput(mo), dFilterAlpha(df) {}
+        //        };
 /**
  * @brief Состояние ПИД-регулятора
  */
@@ -122,7 +153,9 @@ public:
     PIDConfig getYawPID() const { return _yawPID; }
 
     // 🔧 Статический метод для преобразования режима в строку
-    static const char* modeToString(StabilizationMode mode);
+    static const char* modeToString(StabilizationMode mode);  
+
+    // static const char* TAG;
 
 private:
     // Указатели на внешние объекты

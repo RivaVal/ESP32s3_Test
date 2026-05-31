@@ -16,8 +16,9 @@
 
 #include <Arduino.h>
 #include <HardwareSerial.h>
-#include "CommonTypes.h"
-#include "Config.h"
+
+#include "common/types.h"
+#include "config/pins.h"
 
 /**
  * @brief Структура телеметрического пакета (44 байта + заголовок/футер + CRC)

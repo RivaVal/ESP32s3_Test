@@ -7,7 +7,7 @@
 #pragma once
 #include <Arduino.h>
 
-class ISensorFilter {
+class ISensorFilter { 
 public:
     virtual ~ISensorFilter() = default;
     virtual void begin(float sampleFreqHz) = 0;

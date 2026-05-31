@@ -18,7 +18,8 @@
 #include <esp_err.h>
 #include <cstdint>
 
-#include "../../config/pins.h"
+#include "config/pins.h"
+
 
 // ============================================================================
 // Конфигурация I2C

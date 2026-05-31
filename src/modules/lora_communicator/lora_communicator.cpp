@@ -6,10 +6,12 @@
  * - Добавлена потокобезопасность (мьютекс) для ISR и loop()
  * - Вся отладка переведена на ESP_LOG
  */
+/**
+* @file lora_communicator.cpp
+* @brief Реализация LoRa приёмника для ESP32-S3 (RadioLib 7.6.0)
+*/
 #include "modules/lora_communicator/lora_communicator.h"
-// #include "lora_communicator.h"
 #include "config/pins.h"
-#include "common/CommonTypes.h"
 
 // Таблица CRC8 (полином 0x07)
 static const uint8_t CRC8_TABLE[256] = {
@@ -36,8 +38,11 @@ uint8_t calculateCRC8(const uint8_t* data, size_t length) {
     for (size_t i = 0; i < length; i++) crc = CRC8_TABLE[crc ^ data[i]];
     return crc;
 }
-
+ 
 LoRaReceiver* LoRaReceiver::_instance = nullptr;
+
+// 🔑 Глобальный экземпляр — определение (вне класса!)
+LoRaReceiver g_lora_receiver;
 
 LoRaReceiver::LoRaReceiver() {
     _instance = this; // Привязка для ISR
@@ -54,6 +59,14 @@ LoRaReceiver::~LoRaReceiver() {
 bool LoRaReceiver::begin() {
     ESP_LOGI(LORA_TAG, "📡 Initializing SX1278...");
     
+    // 🔑 1. ЯВНАЯ ИНИЦИАЛИЗАЦИЯ SPI
+    SPI.begin(Config::Pins::LORA_SCLK, Config::Pins::LORA_MISO, 
+              Config::Pins::LORA_MOSI, Config::Pins::LORA_CS);
+    SPI.setFrequency(10000000);
+    SPI.setDataMode(SPI_MODE0);
+    delay(10);
+    
+    // 2. Создание объектов
     // Создаём объекты RadioLib
     _module = new Module(Config::Pins::LORA_CS, Config::Pins::LORA_DIO0, 
                          Config::Pins::LORA_RST, Config::Pins::LORA_DIO1, SPI);
@@ -63,15 +76,33 @@ bool LoRaReceiver::begin() {
         return false;
     }
 
-    // Инициализация радио (RadioLib 7.6.0 API)
+    // 3. Инициализация радио (RadioLib 7.6.0 API)
     int state = _radio->begin(Config::Radio::FREQUENCY, Config::Radio::BANDWIDTH,
                               Config::Radio::SPREADING_FACTOR, Config::Radio::CODING_RATE,
                               Config::Radio::SYNC_WORD, Config::Radio::OUTPUT_POWER,
                               Config::Radio::PREAMBLE_LEN);
+
+    // 🔑 4. Расширенная обработка ошибок
+    // В lora_communicator.cpp — в методе begin(), после вызова _radio->begin():
     if (state != RADIOLIB_ERR_NONE) {
         ESP_LOGE(LORA_TAG, "❌ begin() failed: %d", state);
+        
+        // 🔑 Детальная диагностика ошибок SX1278
+        if (state == RADIOLIB_ERR_CHIP_NOT_FOUND) {
+            ESP_LOGE(LORA_TAG, "   🔍 Проверьте:");
+            ESP_LOGE(LORA_TAG, "   • Питание модуля (3.3В стабильно?)");
+            ESP_LOGE(LORA_TAG, "   • Подключение SPI: CS=%d, SCLK=%d, MISO=%d, MOSI=%d",
+                    Config::Pins::LORA_CS, Config::Pins::LORA_SCLK,
+                    Config::Pins::LORA_MISO, Config::Pins::LORA_MOSI);
+            ESP_LOGE(LORA_TAG, "   • Пины RST=%d, DIO0=%d, DIO1=%d",
+                    Config::Pins::LORA_RST, Config::Pins::LORA_DIO0, Config::Pins::LORA_DIO1);
+            ESP_LOGE(LORA_TAG, "   • SPI.begin() вызван до инициализации RadioLib?");
+        } else if (state == RADIOLIB_ERR_INVALID_FREQUENCY) {
+            ESP_LOGE(LORA_TAG, "   ⚠️ Частота %.1f MHz вне диапазона SX1278!", Config::Radio::FREQUENCY);
+        }
         return false;
     }
+    
     _radio->setCRC(true);
 
     // Настройка прерываний
@@ -88,6 +119,7 @@ bool LoRaReceiver::begin() {
     _initialized = true;
     _state = LoRaState::LISTENING;
     ESP_LOGI(LORA_TAG, "✅ Receiver READY | Freq:%.1f MHz SF%d", Config::Radio::FREQUENCY, Config::Radio::SPREADING_FACTOR);
+    //ESP_LOGI(LORA_TAG, "✅ Receiver READY");
     return true;
 }
 
@@ -138,7 +170,7 @@ void LoRaReceiver::handleRxDone() {
     if (validatePacket(_rxBuffer)) {
         portENTER_CRITICAL(&_mux);
         _stats.packetsReceived++;
-        _stats.packetsSuccess++;
+    //    _stats.packetsSuccess++;
         _stats.lastRssi = _radio->getRSSI();
         _stats.lastPacketTime = millis();
         portEXIT_CRITICAL(&_mux);
@@ -246,8 +278,26 @@ void IRAM_ATTR onLoraDio0ISR() {
 }
 
 void IRAM_ATTR onLoraDio1ISR() {
+    // 🔑 Исправлено: явное обращение к статическому члену класса
     if (LoRaReceiver::_instance) {
-        // Таймаут приёма: просто перезапускаем приём
-        _instance->_radio->startReceive();
+        LoRaReceiver::_instance->_radio->startReceive();
+        
+        // Опционально: счётчик таймаутов
+        portENTER_CRITICAL_ISR(&LoRaReceiver::_instance->_mux);
+        LoRaReceiver::_instance->_stats.receive_timeouts++;
+        portEXIT_CRITICAL_ISR(&LoRaReceiver::_instance->_mux);
     }
+
+
+   // if (LoRaReceiver::_instance) {
+        // Таймаут приёма: просто перезапускаем приём
+        // _instance->_radio->startReceive();
+
+        // 🔑 Исправлено: явное обращение к статическому члену
+        // LoRaReceiver::_instance->_radio->startReceive();
+    //}
 }
+
+
+// 🔧 В конце файла:
+// LoRaReceiver g_lora_receiver;  // ✅ Глобальный экземпляр

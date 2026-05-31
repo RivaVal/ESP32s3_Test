@@ -12,9 +12,18 @@
 
 #include <Arduino.h>
 #include "esp_log.h"
-#include "CommonTypes.h"
-#include "I2C_Master.h"
-#include "FilterManager.h"
+
+#include "common/types.h"
+#include "modules/i2c_master/i2c_master.h"
+#include "modules/filter_manager/FilterManager.h"
+
+#include "common/CommonTypes.h"  // — где определена SensorData
+#include "modules/i2c_master/i2c_master.h"
+#include "modules/filter_manager/FilterManager.h"
+
+// #include "CommonTypes.h"
+// #include "I2C_Master.h"
+// #include "FilterManager.h"
 
 /**
  * @file MPU9250_Handler.h

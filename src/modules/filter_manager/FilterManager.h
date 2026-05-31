@@ -12,7 +12,7 @@
 #ifndef FILTER_MANAGER_H
 #define FILTER_MANAGER_H
 
-#include "common/types.h"
+#include "common/types.h" 
 
 #include "modules/filter_manager/MahonyFilter.h"
 #include "modules/filter_manager/MadgwickFilter.h"

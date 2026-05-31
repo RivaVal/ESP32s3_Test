@@ -12,6 +12,8 @@
 #pragma once
 #include <cstdint>
 #include <driver/ledc.h>
+#include <RadioLib.h>
+#include <driver/adc.h>
 
 namespace Config {
 namespace Pins {
@@ -38,12 +40,60 @@ namespace Pins {
     constexpr uint8_t I2C_SDA    = 8;
     constexpr uint8_t I2C_SCL    = 9; // Конфликт с RST(9) устранен (RST -> 15)
 
+
+    // ============================================================================
+    // 🔗 UART2 ДЛЯ RPi Zero 2W + АППАРАТНЫЙ FLOW CONTROL
+    // ============================================================================
+    // 🔑 RTS/CTS подключены к GPIO 2 и GPIO 3. 
+    // ⚠️ Примечание: GPIO 2 больше не используется для LED_STATUS (переназначен на RTS)
+    constexpr uint8_t UART_RPI_TX  = 5;   ///< ESP32 TX → RPi RX
+    constexpr uint8_t UART_RPI_RX  = 6;   ///< ESP32 RX ← RPi TX
+    constexpr uint8_t UART_RPI_RTS = 1;  ///< 🔑 ESP32 Output → RPi CTS (готовность принять)
+    constexpr uint8_t UART_RPI_CTS = 3;   ///< 🔑 RPi Output → ESP32 CTS (готовность принять)
+
+    // --- Мониторинг Батареи (ADC) ---
+    // Безопасный пин, не конфликтует с USB (19/20) и Flash/PSRAM.
+    // GPIO 7 = ADC1_CH6. Поддерживает калибровку (Line Fitting).
+    constexpr uint8_t BATTERY_ADC_PIN = 7;
+
+    // --- GPS (UART) ---
+    constexpr uint8_t GPS_RX = 18; // Прием данных от GPS
+    constexpr uint8_t GPS_TX = 17; // Передача данных GPS
+
+    // --- Периферия ---
+    constexpr uint8_t BUZZER_PIN = 255;   // ⛔ Отключен по запросу (освобождает ресурсы)
+    // constexpr uint8_t LED_STATUS = 2; // Встроенный LED
+    constexpr uint8_t LED_STATUS = 2; // Встроенный LED //
+    // ============================================================================
+    // 🔗 UART ШИНА ДЛЯ RASPBERRY PI ZERO 2W (UART2)
+    // ============================================================================
+    /**
+    * @brief Аппаратный UART2 для связи с RPi Zero 2W
+    * @details 
+    *   • TX (ESP32-S3 GPIO5) → RX (RPi GPIO14/BCM14)
+    *   • RX (ESP32-S3 GPIO6) ← TX (RPi GPIO15/BCM15)
+    *   • Скорость: 115200 или 921600 бод (аппаратно стабильно)
+    *   • Логика 3.3V, общий GND обязателен. Уровневые конвертеры НЕ нужны.
+    *   • RTS (GPIO3) → RPi CTS (ESP32 сообщает, что готов принять)
+    *   • CTS (GPIO42)← RPi RTS (ESP32 получает сигнал о готовности RPi принять)
+    *   • Скорость: 921600 бод. Без Flow Control при такой скорости возможны потери пакетов.
+    * @note GPIO 5 и 6 безопасны на ESP32-S3-WROOM-1, не конфликтуют с Flash/PSRAM/USB.
+    */
+            //        constexpr uint8_t UART_RPI_TX  = 5;  ///< ESP32-S3 TX → RPi RX
+            //        constexpr uint8_t UART_RPI_RX  = 6;  ///< ESP32-S3 RX ← RPi TX
+            //        constexpr uint8_t UART_RPI_RTS = 3;  ///< Ready To Send (ESP32)
+            //        constexpr uint8_t UART_RPI_CTS = 42; ///< Clear To Send (RPi)    
+
+    // Опционально: аппаратный flow control (раскомментировать при высоких нагрузках)
+    // constexpr uint8_t UART_RPI_RTS = 3;  ///< Ready To Send (ESP32)
+    // constexpr uint8_t UART_RPI_CTS = 42; ///< Clear To Send (RPi)
+
 } //END namespace Pins
 
     // =========================================================================
     // ПАРАМЕТРЫ РАДИО (LoRa)
     // =========================================================================
-    namespace Radio {
+namespace Radio {
         // ============================================================================
         // 🔧 ФЛАГИ УСЛОВНОЙ КОМПИЛЯЦИИ LoRa
         // ============================================================================
@@ -96,10 +146,10 @@ namespace Pins {
         constexpr uint32_t ACK_TIMEOUT_MS = 20; // 20 мс (только для передатчика)
         constexpr uint8_t RX_PRINT_INTERVAL = 16; // Печатать каждый N-й пакет
         constexpr uint8_t TX_PRINT_INTERVAL = 10;    // Каждые 10 пакетов
-    };  // end namespace Radio
+};  // end namespace Radio
 
 
-    namespace Timing {   
+namespace Timing {   
 
             // Таймауты и интервалы
         constexpr uint16_t TX_TIMEOUT_MS = 200;
@@ -128,11 +178,27 @@ namespace Pins {
         constexpr uint32_t CONNECTION_TIMEOUT_MS = 5000; // Таймаут соединения
             //  };
 
-    }; // end namespace Timing 
+}; // end namespace Timing adc_atten_t
 
+namespace Battery {
+        // === Конфигурация мониторинга АКБ ===
+        constexpr uint8_t DEFAULT_CELL_COUNT = 4;           // 4S по умолчанию
+        constexpr uint8_t BATTERY_ADC_PIN = 7;              // GPIO для ADC
+            //constexpr adc_atten_t BATTERY_ADC_ATTENUATION = ADC_ATTEN_DB_12; // или ADC_ATTEN_DB_11
+            // ✅ Вместо макроса используйте прямое значение:
+            // ADC_ATTEN_DB_12 = 3 (см. adc_atten_t в driver/adc.h)
+        constexpr uint8_t BATTERY_ADC_ATTENUATION = 3;
+        constexpr uint32_t BATTERY_ADC_RESOLUTION = 4095;   // 12-bit ADC
+        constexpr float BATTERY_ADC_MAX_VOLTAGE = 3.3f;     // Макс. напряжение на пине (В)
+        constexpr float BATTERY_VOLTAGE_DIVIDER_RATIO = 4.0f; // Коэффициент делителя (R1+R2)/R2
+        // 🔧 ДОБАВИТЬ отсутствующую константу:
+        constexpr uint16_t ADC_VREF_MV = 1100;  // ← Референсное напряжение, мВ
+        
+        // === Тайминги ===
+        constexpr uint32_t STARTUP_CHECK_DELAY = 2000;      // Задержка при старте (мс)
+        constexpr uint32_t CHECK_INTERVAL_MS = 5000;        // Интервал проверки (мс)
+} // END namespace Battery
 
-    //        namespace Timing {
-    //            constexpr uint32_t STATS_PRINT_INTERVAL_MS = 3500;
-    //            constexpr uint32_t CONNECTION_TIMEOUT_MS   = 5000;
-    //        } //END namespace Timing
 } //END namespace Config
+
+

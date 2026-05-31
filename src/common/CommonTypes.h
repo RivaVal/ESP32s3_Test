@@ -175,6 +175,7 @@ struct LoRaConfig_t {
 };
 
 
+#pragma pack(push, 1)
 /**
  * @struct DataComSet_t
  * @brief Структура передаваемых данных управления
@@ -204,6 +205,7 @@ struct AckPacket_t {
     uint8_t status = 0;          // Статус получения (1-OK, 0-ERROR)
     uint8_t crc8 = 0;            // Контрольная сумма
 };
+#pragma pack(pop)
 
 // 🔧 ПЕРЕНЕСЛИ РАЗМЕРЫ БУФЕРОВ И ВАЛИДАЦИЮ 
 constexpr uint8_t MAX_PACKET_SIZE = sizeof(DataComSet_t);
@@ -330,7 +332,7 @@ struct ReceiverStats {
     uint32_t duplicatePackets = 0;
     uint32_t packetErrors = 0;
     uint32_t lastPacketTime = 0;
-    int16_t lastRSSI = 0;
+    int16_t lastRssi = 0;
     float lastSNR = 0.0f;
     uint32_t fsmErrors = 0;
     uint32_t recoveryAttempts = 0;
@@ -338,6 +340,7 @@ struct ReceiverStats {
     // ACK stats
     uint32_t acksSent = 0;
     uint32_t acksSentSuccess = 0;
+    uint32_t acksSuccess = 0;
     uint32_t ackSendErrors = 0;
     uint32_t ackRequests = 0;
     uint32_t ackResponses = 0;
@@ -348,6 +351,7 @@ struct ReceiverStats {
     // 🆕 ДОБАВЛЕНО: Счетчик таймаутов приема (DIO1)
     uint32_t receive_timeouts = 0; 
 };
+
 
 #pragma pack(pop)
 

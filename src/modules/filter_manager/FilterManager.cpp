@@ -10,13 +10,24 @@
 FilterManager::FilterManager() : _activeFilter(&_mahony), _currentType(FilterType::MAHONY), 
                                  _pendingSwitch(false), _pendingType(FilterType::MAHONY) {}
 
-void FilterManager::begin(float sampleFreqHz) {
+    //                void FilterManager::begin(float sampleFreqHz) {
+    //                    _mahony.begin(sampleFreqHz);
+    //                    _madgwick.begin(sampleFreqHz);
+    //                    _vibEstimator.configure(0.15f, 0.05f, 1.5f); // Настройка вибрационного монитора
+    //                    _activeFilter = &_mahony;
+    //                    _currentType = FilterType::MAHONY;
+    //                }
+
+bool FilterManager::begin(float sampleFreqHz) {
     _mahony.begin(sampleFreqHz);
     _madgwick.begin(sampleFreqHz);
-    _vibEstimator.configure(0.15f, 0.05f, 1.5f); // Настройка вибрационного монитора
+    _vibEstimator.configure(0.15f, 0.05f, 1.5f);
     _activeFilter = &_mahony;
     _currentType = FilterType::MAHONY;
+    
+    return true;  // ← Добавить возврат
 }
+
 
 void FilterManager::enableAdaptive(bool enable) {
     _adaptiveEnabled = enable;
