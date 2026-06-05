@@ -44,11 +44,17 @@ static I2CMasterController i2c_manager;
 static PCA9685ServoController servo_controller;
 #endif
 
-// 🔧 ВРЕМЕННО ОТКЛЮЧИТЬ, если файлы отсутствуют:
+// ============================================================================
+// 🧭 IMU (MPU9250) и Стабилизация полёта
+// ============================================================================
 #if CFG_ENABLE_IMU
+#include "modules/imu_handler/MPU9250_Handler.h"
+static MPU9250Handler mpu9250_handler;  // 🔑 ГЛОБАЛЬНЫЙ ЭКЗЕМПЛЯР IMU
+
 #include "modules/flight_stabilizer/FlightStabilizer.h"
 static FlightStabilizer flightStabilizer;
 #endif
+
 
 // Условная компиляция выберет **только нужный класс**. 
 // Старый заголовочный файл с ошибками даже не попадёт 
@@ -60,7 +66,7 @@ static BatteryMonitor batteryMonitor;  // ← Правильный тип!
 
 #if CFG_ENABLE_UART_BRIDGE
 #include "modules/telemetry_uart/TelemetryUARTBridge.h"
-static ...;
+// TelemetryUARTBridge использует статические методы, экземпляр класса не нужен
 #endif
 
 // #if CFG _ENABLE_BATTERY_MONITOR
@@ -114,6 +120,15 @@ void setup() {
             ESP_LOGE(TAG, "❌ I2C initialization FAILED!");
         } else {
             ESP_LOGI(TAG, "✅ I2C Master ready");
+        
+                        // 🔍 ДИАГНОСТИКА: Сканирование I2C шины
+                        ESP_LOGI(TAG, "🔍 ========================================");
+                        ESP_LOGI(TAG, "🔍 СКАНИРОВАНИЕ I2C ШИНЫ (SDA=GPIO%d, SCL=GPIO%d)", 
+                                Config::Pins::I2C_SDA, Config::Pins::I2C_SCL);
+                        ESP_LOGI(TAG, "🔍 Ожидаемые устройства: PCA9685(0x40), MPU9250(0x68)");
+                        ESP_LOGI(TAG, "🔍 ========================================");
+                        i2c_manager.scanDevices();  // ← Вызов встроенного сканера
+                        ESP_LOGI(TAG, "🔍 ========================================");
         }
     }
 #endif
@@ -149,19 +164,61 @@ void setup() {
         ESP_LOGI(TAG, "📡 Initializing LoRa (SX1278)...");
         if (!lora_init()) {
             ESP_LOGE(TAG, "❌ LoRa init FAILED! Critical error.");
+        // 🔧 ВРЕМЕННО: не блокируем setup(), чтобы проверить MPU9250 и FlightStabilizer
             // Индикация аппаратной ошибки
-            pinMode(LED_BUILTIN, OUTPUT);
-            while (true) {
-                digitalWrite(LED_BUILTIN, HIGH); delay(100);
-                digitalWrite(LED_BUILTIN, LOW);  delay(200);
-            }
+        //                    pinMode(LED_BUILTIN, OUTPUT);
+        //                    while (true) {
+        //                        digitalWrite(LED_BUILTIN, HIGH); delay(100);
+        //                        digitalWrite(LED_BUILTIN, LOW);  delay(200);
+        //                    }
         }
         ESP_LOGI(TAG, "✅ LoRa ready");
     }
 #endif
 
     // ========================================================================
-    // 4. Инициализация BATTERY_MONITOR
+    // 5. Инициализация MPU9250 (IMU) - ТРЕБУЕТ РАБОЧИЙ I2C
+    // ========================================================================
+    #if CFG_ENABLE_IMU
+    if (g_ModuleConfig.enableIMU) {
+        ESP_LOGI(TAG, "🧭 Initializing MPU9250 (IMU)...");
+    #if CFG_ENABLE_I2C_MASTER
+        if (i2c_manager.isInitialized()) {
+            if (!mpu9250_handler.begin(i2c_manager)) {
+                ESP_LOGE(TAG, "❌ MPU9250 init FAILED!");
+            } else {
+                ESP_LOGI(TAG, "✅ MPU9250 ready | Calibration started...");
+                // Ждем завершения калибровки гироскопа (200 семплов ~ 1 сек)
+                delay(1000); 
+            }
+        } else {
+            ESP_LOGW(TAG, "⚠️ MPU9250 skipped: I2C not initialized");
+        }
+    #endif
+    }
+    #endif
+
+    // ========================================================================
+    // 6. Инициализация FlightStabilizer (ПИД-регуляторы)
+    // ========================================================================
+    #if CFG_ENABLE_IMU && CFG_ENABLE_SERVO_MOTORS
+    if (mpu9250_handler.isInitialized() && servo_controller.isInitialized()) {
+        ESP_LOGI(TAG, "🛩️ Initializing FlightStabilizer...");
+        if (!flightStabilizer.begin(&mpu9250_handler, &servo_controller)) {
+            ESP_LOGE(TAG, "❌ FlightStabilizer init FAILED!");
+        } else {
+            ESP_LOGI(TAG, "✅ FlightStabilizer ready");
+            // 🔑 Запуск задачи стабилизации на ЯДРЕ 1 (FreeRTOS)
+            flightStabilizer.startStabilizationTask();
+        }
+    } else {
+        ESP_LOGW(TAG, "⚠️ FlightStabilizer skipped: IMU or Servos not ready");
+    }
+    #endif
+
+
+    // ========================================================================
+    // 7. Инициализация BATTERY_MONITOR
     // ========================================================================
     #if CFG_ENABLE_BATTERY_MONITOR
         ESP_LOGI(TAG, "🔋 Initializing Battery Monitor...");
@@ -171,7 +228,7 @@ void setup() {
     #endif
 
 
-    ESP_LOGI(TAG, "🟢 Setup complete. Entering main loop...");
+        ESP_LOGI(TAG, "🟢 Setup complete. Entering main loop...");
 }
 
 

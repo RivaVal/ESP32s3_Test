@@ -182,20 +182,43 @@ bool MPU9250Handler::_initMPU6500() {
         ESP_LOGE(TAG_MPU, "❌ Не удалось настроить акселерометр");
         return false;
     }
-    
-    // Проверка WHO_AM_I (должно быть 0x71 для MPU6500)
+
+        // Новая версия!!
+        // Проверка WHO_AM_I (0x71 для MPU6500/9250, 0x70 для MPU6000/6050)
     uint8_t whoami;
     if (!_i2cManager->readRegister(MPU6500_ADDR, 0x75, &whoami, 1)) {
         ESP_LOGE(TAG_MPU, "❌ Не удалось прочитать WHO_AM_I");
         return false;
     }
-    if (whoami != 0x71) {
-        ESP_LOGE(TAG_MPU, "❌ WHO_AM_I mismatch: ожидал 0x71, получил 0x%02X", whoami);
+    
+    if (whoami != 0x71 && whoami != 0x70) {
+        ESP_LOGE(TAG_MPU, "❌ WHO_AM_I mismatch: ожидал 0x71 (MPU6500/9250) или 0x70 (MPU6000/6050), получил 0x%02X", whoami);
         return false;
     }
     
-    ESP_LOGI(TAG_MPU, "✅ MPU6500 инициализирован (WHO_AM_I=0x%02X)", whoami);
+    if (whoami == 0x70) {
+        ESP_LOGW(TAG_MPU, "⚠️ Обнаружен MPU-6000/6050 (вместо MPU-9250).");
+        ESP_LOGW(TAG_MPU, "   Магнитометр работать не будет, но стабилизация Roll/Pitch (6 осей) будет работать отлично!");
+    } else {
+        ESP_LOGI(TAG_MPU, "✅ MPU-6500/9250 инициализирован (WHO_AM_I=0x%02X)", whoami);
+    }
+    
     return true;
+
+            // СТАОАЯ ВЕРСИЯ !!!
+        //                    // Проверка WHO_AM_I (должно быть 0x71 для MPU6500)
+        //                    uint8_t whoami;
+        //                    if (!_i2cManager->readRegister(MPU6500_ADDR, 0x75, &whoami, 1)) {
+        //                        ESP_LOGE(TAG_MPU, "❌ Не удалось прочитать WHO_AM_I");
+        //                        return false;
+        //                    }
+        //                    if (whoami != 0x71) {
+        //                        ESP_LOGE(TAG_MPU, "❌ WHO_AM_I mismatch: ожидал 0x71, получил 0x%02X", whoami);
+        //                        return false;
+        //                    }
+    
+        //                ESP_LOGI(TAG_MPU, "✅ MPU6500 инициализирован (WHO_AM_I=0x%02X)", whoami);
+        //                return true;
 }
 
 /**

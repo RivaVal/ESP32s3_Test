@@ -12,45 +12,38 @@
  * @version 2.0.0 (ШАГ 5: Миграция LEDC)
  * @date 2026-05-28
  */
+/**
+ * @file unified_ledc.h
+ * @brief Контроллер управления силовыми моторами через аппаратный ШИМ LEDC ESP32-S3
+ * @version 2.1.0 (Рефакторинг: пины перенесены в config/pins.h)
+ */
 #pragma once
-
 #include <Arduino.h>
 #include <driver/ledc.h>
 #include "esp_err.h"
 #include "common/types.h"
+#include "config/pins.h"  // 🔑 ЗАВИСИМОСТЬ ОТ ГЛОБАЛЬНОГО КОНФИГА
 
 class UnifiedLEDCController {
 private:
     bool _initialized = false;
     const char* _lastError = "No error";
 
-    // 🔑 КОНФИГУРАЦИЯ ПИНОВ И КАНАЛОВ (ESP32-S3)
-    static constexpr uint8_t _motorPins[2]   = {16, 21};                 // GPIO16, GPIO21
-    static constexpr ledc_channel_t _channels[2] = {LEDC_CHANNEL_1, LEDC_CHANNEL_2};
-    static constexpr uint32_t _freqHz        = 1000;                     // Частота PWM для моторов
-    static constexpr uint32_t _dutyResolution = 10;                      // 10 бит (0-1023)
+        //                // 🔑 ПАРАМЕТРЫ ШИМ (Частота и разрешение)
+    static constexpr uint32_t _freqHz         = 1000;  // 1 кГц (стандарт для ESC/моторов)
+    static constexpr uint32_t _dutyResolution = 10;    // 10 бит (0-1023)
+    static constexpr ledc_mode_t _speedMode   = LEDC_LOW_SPEED_MODE;
 
     esp_err_t setupTimer();
     esp_err_t setupChannel(uint8_t index);
 
 public:
     UnifiedLEDCController();
-
-    /** @brief Инициализация LEDC таймера и каналов */
     bool begin();
-
-    /** @brief Установка мощности мотора (0.0 - 100.0%) */
     bool setMotorPower(uint8_t motorIndex, float powerPercent);
-
-    /** @brief Мгновенная остановка всех моторов */
     void stopAllMotors();
-
-    /** @brief Безопасный предстартовый тест с ограничением мощности */
     bool runStartupDiagnostic(float maxPowerPercent = 30.0f, uint32_t durationMs = 2000);
-
-    /** @brief Проверка статуса инициализации */
+    
     bool isInitialized() const { return _initialized; }
-
-    /** @brief Получение текста последней ошибки */
     const char* getLastError() const { return _lastError; }
 };

@@ -27,7 +27,7 @@
 
 // Обратная совместимость: если включен хоть один, включаем общий флаг
 #if (CFG_ENABLE_BATTERY_MONITOR_LEGACY == 1 || CFG_ENABLE_BATTERY_MONITOR_V2 == 1)
-    #define CFG_ENABLE_BATTERY_MONITOR 1
+    #define CFG_ENABLE_BATTERY_MONITOR 0
 #else
     #define CFG_ENABLE_BATTERY_MONITOR 0
 #endif
@@ -76,7 +76,7 @@
 #endif
 
 #ifndef CFG_ENABLE_UART_DRIDGE
-#define CFG_ENABLE_UART_BRIDGE     0   ///< 1 = Включить UART мост to Rpi
+#define CFG_ENABLE_UART_BRIDGE     1   ///< 1 = Включить UART мост to Rpi
 #endif
 
 // ============================================================================

@@ -8,6 +8,11 @@
  * 
  * @note ESP32-S3 НЕ имеет аппаратных дефолтов для SPI/I2C. Пины задаются явно!
  * @version 1.0 (Миграция в PlatformIO)
+ * 
+ * 
+ * 
+ * 
+ * 
  */
 #pragma once
 #include <cstdint>
@@ -40,45 +45,79 @@ namespace Pins {
     constexpr uint8_t I2C_SDA    = 8;
     constexpr uint8_t I2C_SCL    = 9; // Конфликт с RST(9) устранен (RST -> 15)
 
+    // ============================================================================
+    // 🔗 UART1 ДЛЯ GPS МОДУЛЯ
+    // ============================================================================
+    // Flow Control для GPS НЕ требуется. Используем стандартные свободные пины.
+    constexpr uint8_t GPS_RX = 18;  ///< ESP32-S3 RX <- GPS TX
+    constexpr uint8_t GPS_TX = 17;  ///< ESP32-S3 TX -> GPS RX
+
 
     // ============================================================================
     // 🔗 UART2 ДЛЯ RPi Zero 2W + АППАРАТНЫЙ FLOW CONTROL
     // ============================================================================
-    // 🔑 RTS/CTS подключены к GPIO 2 и GPIO 3. 
-    // ⚠️ Примечание: GPIO 2 больше не используется для LED_STATUS (переназначен на RTS)
-    constexpr uint8_t UART_RPI_TX  = 5;   ///< ESP32 TX → RPi RX
-    constexpr uint8_t UART_RPI_RX  = 6;   ///< ESP32 RX ← RPi TX
-    constexpr uint8_t UART_RPI_RTS = 1;  ///< 🔑 ESP32 Output → RPi CTS (готовность принять)
-    constexpr uint8_t UART_RPI_CTS = 3;   ///< 🔑 RPi Output → ESP32 CTS (готовность принять)
+    // Пины 5, 6, 41, 42 выбраны как наиболее безопасные на ESP32-S3-N16R8.
+    // Они не являются strapping-пинами и не конфликтуют с OPI PSRAM/Flash.
+    constexpr uint8_t UART_RPI_TX  = 5;   ///< ESP32-S3 TX  -> RPi RX
+    constexpr uint8_t UART_RPI_RX  = 6;   ///< ESP32-S3 RX  <- RPi TX
+    constexpr uint8_t UART_RPI_RTS = 41;  ///< ESP32-S3 RTS -> RPi CTS (готовность принять)
+    constexpr uint8_t UART_RPI_CTS = 42;  ///< ESP32-S3 CTS <- RPi RTS (готовность RPi принять)
+
+                       
+    // ============================================================================
+    // ⚡ СИЛОВЫЕ МОТОРЫ (LEDC PWM)
+    // ============================================================================
+    // ⚡ Моторы через LEDC (аппаратный ШИМ)
+    // 🔑 Проверка: пины 40,41 поддерживают LEDC на ESP32-S3
+    // constexpr uint8_t MOTOR_PIN_1 = 16;      // GPIO16 -> LEDC CH1
+    // constexpr uint8_t MOTOR_PIN_2 = 21;      // GPIO21 -> LEDC CH2
+    constexpr uint8_t MOTOR_LEFT_PIN  = 16;  // GPIO16 -> LEDC CH1
+    constexpr uint8_t MOTOR_RIGHT_PIN = 21;  // GPIO21 -> LEDC CH2
+
+    // 🔑 КОНФИГУРАЦИЯ ПИНОВ И КАНАЛОВ (ESP32-S3)
+    static constexpr uint8_t _motorPins[2]   =      {16, 21};            // GPIO16, GPIO21
+        //                static constexpr ledc_channel_t _channels[2] = {LEDC_CHANNEL_1, LEDC_CHANNEL_2};
+        //                static constexpr uint32_t _freqHz        = 1000;                     // Частота PWM для моторов
+        //                static constexpr uint32_t _dutyResolution = 10;                      // 10 бит (0-1023)
+
+    // 🔑 ПАРАМЕТРЫ ШИМ (Частота и разрешение)
+    // static constexpr uint32_t freqHz         = 1000;  // 1 кГц (стандарт для ESC/моторов)
+    // static constexpr uint32_t dutyResolution = 10;    // 10 бит (0-1023)
+    // static constexpr ledc_mode_t speedMode   = LEDC_LOW_SPEED_MODE;
+
+    // Настройки таймеров и каналов LEDC (ESP32-S3 имеет 4 таймера, 8 каналов)
+    constexpr uint8_t LEDC_TIMER_NUM  = 0;   // LEDC_TIMER_0
+    constexpr uint8_t LEDC_CH_LEFT    = 1;   // LEDC_CHANNEL_1
+    constexpr uint8_t LEDC_CH_RIGHT   = 2;   // LEDC_CHANNEL_2
 
     // --- Мониторинг Батареи (ADC) ---
     // Безопасный пин, не конфликтует с USB (19/20) и Flash/PSRAM.
     // GPIO 7 = ADC1_CH6. Поддерживает калибровку (Line Fitting).
     constexpr uint8_t BATTERY_ADC_PIN = 7;
 
-    // --- GPS (UART) ---
-    constexpr uint8_t GPS_RX = 18; // Прием данных от GPS
-    constexpr uint8_t GPS_TX = 17; // Передача данных GPS
+                                // --- GPS (UART) ---
+                                // constexpr uint8_t GPS_RX = 18; // Прием данных от GPS
+                                // constexpr uint8_t GPS_TX = 17; // Передача данных GPS
 
     // --- Периферия ---
     constexpr uint8_t BUZZER_PIN = 255;   // ⛔ Отключен по запросу (освобождает ресурсы)
     // constexpr uint8_t LED_STATUS = 2; // Встроенный LED
     constexpr uint8_t LED_STATUS = 2; // Встроенный LED //
-    // ============================================================================
-    // 🔗 UART ШИНА ДЛЯ RASPBERRY PI ZERO 2W (UART2)
-    // ============================================================================
-    /**
-    * @brief Аппаратный UART2 для связи с RPi Zero 2W
-    * @details 
-    *   • TX (ESP32-S3 GPIO5) → RX (RPi GPIO14/BCM14)
-    *   • RX (ESP32-S3 GPIO6) ← TX (RPi GPIO15/BCM15)
-    *   • Скорость: 115200 или 921600 бод (аппаратно стабильно)
-    *   • Логика 3.3V, общий GND обязателен. Уровневые конвертеры НЕ нужны.
-    *   • RTS (GPIO3) → RPi CTS (ESP32 сообщает, что готов принять)
-    *   • CTS (GPIO42)← RPi RTS (ESP32 получает сигнал о готовности RPi принять)
-    *   • Скорость: 921600 бод. Без Flow Control при такой скорости возможны потери пакетов.
-    * @note GPIO 5 и 6 безопасны на ESP32-S3-WROOM-1, не конфликтуют с Flash/PSRAM/USB.
-    */
+            // ============================================================================
+            // 🔗 UART ШИНА ДЛЯ RASPBERRY PI ZERO 2W (UART2)
+            // ============================================================================
+            /**
+            * @brief Аппаратный UART2 для связи с RPi Zero 2W
+            * @details 
+            *   • TX (ESP32-S3 GPIO5) → RX (RPi GPIO14/BCM14)
+            *   • RX (ESP32-S3 GPIO6) ← TX (RPi GPIO15/BCM15)
+            *   • Скорость: 115200 или 921600 бод (аппаратно стабильно)
+            *   • Логика 3.3V, общий GND обязателен. Уровневые конвертеры НЕ нужны.
+            *   • RTS (GPIO3) → RPi CTS (ESP32 сообщает, что готов принять)
+            *   • CTS (GPIO42)← RPi RTS (ESP32 получает сигнал о готовности RPi принять)
+            *   • Скорость: 921600 бод. Без Flow Control при такой скорости возможны потери пакетов.
+            * @note GPIO 5 и 6 безопасны на ESP32-S3-WROOM-1, не конфликтуют с Flash/PSRAM/USB.
+            */
             //        constexpr uint8_t UART_RPI_TX  = 5;  ///< ESP32-S3 TX → RPi RX
             //        constexpr uint8_t UART_RPI_RX  = 6;  ///< ESP32-S3 RX ← RPi TX
             //        constexpr uint8_t UART_RPI_RTS = 3;  ///< Ready To Send (ESP32)
