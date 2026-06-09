@@ -56,7 +56,7 @@ public:
 
 private:
     // FilterManager _filter;
-    bool _magAvailable = false; // если магнитометр отключён
+    // bool _magAvailable = false; // если магнитометр отключён
     I2CMasterController* _i2cManager;
     bool _initialized;
     SensorData _sensorData;
@@ -75,6 +75,11 @@ private:
     bool _initAK8963();
     bool _readRawData(int16_t accel[3], int16_t gyro[3], int16_t temp, int16_t mag[3]);
     void _applyComplementaryFilter(float dt);
+
+    bool _magAvailable = false;           // Магнитометр доступен
+    bool _magDirectConnection = false;    // Магнитометр подключен напрямую (не через bypass)
+    bool _magBypassRequired = false;      // Требуется I2C Bypass для магнитометра
+
 };
 #endif // MPU9250_HANDLER_H
 

@@ -44,16 +44,37 @@ static I2CMasterController i2c_manager;
 static PCA9685ServoController servo_controller;
 #endif
 
-// ============================================================================
-// 🧭 IMU (MPU9250) и Стабилизация полёта
-// ============================================================================
-#if CFG_ENABLE_IMU
-#include "modules/imu_handler/MPU9250_Handler.h"
-static MPU9250Handler mpu9250_handler;  // 🔑 ГЛОБАЛЬНЫЙ ЭКЗЕМПЛЯР IMU
+    // ============================================================================
+    // 🧭 IMU (MPU9250) и Стабилизация полёта
+    // ============================================================================
+        // #if CFG_ENABLE_IMU
+        // #include "modules/imu_handler/MPU9250_Handler.h"
+        // static MPU9250Handler mpu9250_handler;  // 🔑 ГЛОБАЛЬНЫЙ ЭКЗЕМПЛЯР IMU
 
+        // #include "modules/flight_stabilizer/FlightStabilizer.h"
+        // static FlightStabilizer flightStabilizer;
+        // #endif
+
+        // Замените инициализацию MPU9250 на GY91 в `main.cpp`:
+
+#if CFG_ENABLE_GY91
+#include "modules/gy91_handler/GY91_Handler.h"
+static GY91Handler gy91_handler;
+#endif
+
+    // ============================================================================
+    // 🧭 IMU (MPU9250) и Стабилизация полёта
+    // ============================================================================
+#if CFG_ENABLE_GY91 && CFG_ENABLE_SERVO_MOTORS
 #include "modules/flight_stabilizer/FlightStabilizer.h"
 static FlightStabilizer flightStabilizer;
 #endif
+
+
+
+// 🔑 ГЛОБАЛЬНЫЕ ПЕРЕМЕННЫЕ ДЛЯ ПЕРЕДАЧИ КОМАНД В ЗАДАЧУ СТАБИЛИЗАЦИИ
+volatile float g_comUp = 127.0f;     // Нейтраль по умолчанию
+volatile float g_comLeft = 127.0f;   // Нейтраль по умолчанию
 
 
 // Условная компиляция выберет **только нужный класс**. 
@@ -68,6 +89,13 @@ static BatteryMonitor batteryMonitor;  // ← Правильный тип!
 #include "modules/telemetry_uart/TelemetryUARTBridge.h"
 // TelemetryUARTBridge использует статические методы, экземпляр класса не нужен
 #endif
+
+// В начале main.cpp (после других #include):
+#if CFG_ENABLE_GPS
+#include "modules/GPS_module/GPS_Handler.h"
+static GPSHandler gps_handler;
+#endif
+
 
 // #if CFG _ENABLE_BATTERY_MONITOR
 // #include "modules/batteryMonitorV2/BatteryMonitorV2.h"
@@ -96,10 +124,7 @@ void setup() {
     //=========================================================================
     Serial.begin(115200);
     uint32_t start = millis();
-    while (!Serial && millis() - start < 3000) { 
-        delay(10); 
-        yield(); 
-    }
+    while (!Serial && millis() - start < 3000) {delay(10); yield();}
     delay(500);
 
     ESP_LOGI(TAG, "🚀 UAV_ESP32S3_Core Startup | Chip: %s Rev%d", 
@@ -146,6 +171,10 @@ void setup() {
             } else {
                 ESP_LOGI(TAG, "✅ PCA9685 ready | 7 servos on CH0-6");
                 servo_controller.resetToNeutral(); // Безопасный старт
+                
+                // 🔑 ТЗ п.1: ПРЕДСТАРТОВЫЙ ТЕСТ СЕРВОПРИВОДОВ
+                ESP_LOGI(TAG, "🏁 Запуск предстартового теста сервоприводов...");
+                servo_controller.runServoTest();
             }
         } else {
             ESP_LOGW(TAG, "⚠️ PCA9685 skipped: I2C not initialized");
@@ -176,56 +205,122 @@ void setup() {
     }
 #endif
 
+        //                // ========================================================================
+        //                // 5. Инициализация MPU9250 (IMU) - ТРЕБУЕТ РАБОЧИЙ I2C
+        //                // ========================================================================
+        //                #if CFG_ENABLE_IMU
+        //                if (g_ModuleConfig.enableIMU) {
+        //                    ESP_LOGI(TAG, "🧭 Initializing MPU9250 (IMU)...");
+        //                #if CFG_ENABLE_I2C_MASTER
+        //                    if (i2c_manager.isInitialized()) {
+        //                        if (!mpu9250_handler.begin(i2c_manager)) {
+        //                            ESP_LOGE(TAG, "❌ MPU9250 init FAILED!");
+        //                        } else {
+        //                            ESP_LOGI(TAG, "✅ MPU9250 ready | Calibration started...");
+        //                            // Ждем завершения калибровки гироскопа (200 семплов ~ 1 сек)
+        //                            delay(1000); 
+        //                        }
+        //                    } else {
+        //                        ESP_LOGW(TAG, "⚠️ MPU9250 skipped: I2C not initialized");
+        //                    }
+        //                #endif
+        //                }
+        //                #endif
     // ========================================================================
-    // 5. Инициализация MPU9250 (IMU) - ТРЕБУЕТ РАБОЧИЙ I2C
+    // 5.1. Инициализация GY-91 (IMU) - ТРЕБУЕТ РАБОЧИЙ I2C
     // ========================================================================
-    #if CFG_ENABLE_IMU
-    if (g_ModuleConfig.enableIMU) {
-        ESP_LOGI(TAG, "🧭 Initializing MPU9250 (IMU)...");
-    #if CFG_ENABLE_I2C_MASTER
+    // В setup() замените блок инициализации IMU:
+    #if CFG_ENABLE_GY91
+    if (g_ModuleConfig.enableGY91) {
+        ESP_LOGI(TAG, "🧭 Initializing GY-91 (MPU-9250 + BMP280)...");
         if (i2c_manager.isInitialized()) {
-            if (!mpu9250_handler.begin(i2c_manager)) {
-                ESP_LOGE(TAG, "❌ MPU9250 init FAILED!");
+            if (!gy91_handler.begin(i2c_manager)) {
+                ESP_LOGE(TAG, "❌ GY-91 init FAILED!");
             } else {
-                ESP_LOGI(TAG, "✅ MPU9250 ready | Calibration started...");
-                // Ждем завершения калибровки гироскопа (200 семплов ~ 1 сек)
-                delay(1000); 
+                ESP_LOGI(TAG, "✅ GY-91 ready | Calibration started...");
+                delay(1000);  // Ждём калибровку гироскопа
             }
         } else {
-            ESP_LOGW(TAG, "⚠️ MPU9250 skipped: I2C not initialized");
+            ESP_LOGW(TAG, "⚠️ GY-91 skipped: I2C not initialized");
         }
-    #endif
     }
     #endif
 
+
     // ========================================================================
-    // 6. Инициализация FlightStabilizer (ПИД-регуляторы)
+    // 6. Инициализация FlightStabilizer  (ПИД-регуляторы)(ТЗ п.2)
     // ========================================================================
-    #if CFG_ENABLE_IMU && CFG_ENABLE_SERVO_MOTORS
-    if (mpu9250_handler.isInitialized() && servo_controller.isInitialized()) {
-        ESP_LOGI(TAG, "🛩️ Initializing FlightStabilizer...");
-        if (!flightStabilizer.begin(&mpu9250_handler, &servo_controller)) {
-            ESP_LOGE(TAG, "❌ FlightStabilizer init FAILED!");
+#if CFG_ENABLE_GY91 && CFG_ENABLE_SERVO_MOTORS
+    if (g_ModuleConfig.enableGY91 && g_ModuleConfig.enableServoMotors) {
+        if (gy91_handler.isInitialized() && servo_controller.isInitialized()) {
+            ESP_LOGI(TAG, "🛩️ Initializing FlightStabilizer...");
+            // 🔑 Передаем указатель на gy91_handler
+            if (!flightStabilizer.begin(&gy91_handler, &servo_controller)) {
+                ESP_LOGE(TAG, "❌ FlightStabilizer init FAILED!");
+            } else {
+                ESP_LOGI(TAG, "✅ FlightStabilizer ready");
+                
+                // 🔑 ВКЛЮЧЕНИЕ СТАБИЛИЗАЦИИ
+                flightStabilizer.enable(); // Включаем стабилизацию
+                
+                // 🔑 Запуск задачи стабилизации на ЯДРЕ 1 (FreeRTOS)
+                flightStabilizer.startStabilizationTask();
+            }
         } else {
-            ESP_LOGI(TAG, "✅ FlightStabilizer ready");
-            // 🔑 Запуск задачи стабилизации на ЯДРЕ 1 (FreeRTOS)
-            flightStabilizer.startStabilizationTask();
+            ESP_LOGW(TAG, "⚠️ FlightStabilizer skipped: IMU or Servos not ready");
         }
-    } else {
-        ESP_LOGW(TAG, "⚠️ FlightStabilizer skipped: IMU or Servos not ready");
     }
-    #endif
+#endif
+
+//    ESP_LOGI(TAG, "🟢 Setup complete. Entering main loop...");
+//}
+
+
+    // ========================================================================
+    // 6.1. Инициализация FlightStabilizer (ПИД-регуляторы)
+    // ========================================================================
+                    //#if CFG_ENABLE_IMU && CFG_ENABLE_SERVO_MOTORS
+                    ////// #if CFG_ENABLE_IMU && CFG_ENABLE_SERVO_MOTORS
+                    //   if (mpu9250_handler.isInitialized() && servo_controller.isInitialized()) {
+                    //    // if (mpu9250_handler.isInitialized() && servo_controller.isInitialized()) {
+                    //        ESP_LOGI(TAG, "🛩️ Initializing FlightStabilizer...");
+                    //        if (!flightStabilizer.begin(&mpu9250_handler, &servo_controller)) {
+                    //            ESP_LOGE(TAG, "❌ FlightStabilizer init FAILED!");
+                    //        } else {
+                    //            ESP_LOGI(TAG, "✅ FlightStabilizer ready");
+                    //            // 🔑 Запуск задачи стабилизации на ЯДРЕ 1 (FreeRTOS)
+                    //            flightStabilizer.startStabilizationTask();
+                    //        }
+                    //    } else {
+                    //        ESP_LOGW(TAG, "⚠️ FlightStabilizer skipped: IMU or Servos not ready");
+                    //    }
+                    //#endif
 
 
     // ========================================================================
     // 7. Инициализация BATTERY_MONITOR
     // ========================================================================
-    #if CFG_ENABLE_BATTERY_MONITOR
-        ESP_LOGI(TAG, "🔋 Initializing Battery Monitor...");
-        if (!batteryMonitor.begin(4)) { // 4S по умолчанию
-            ESP_LOGE(TAG, "❌ Battery Monitor init failed");
+#if CFG_ENABLE_BATTERY_MONITOR
+    ESP_LOGI(TAG, "🔋 Initializing Battery Monitor...");
+    if (!batteryMonitor.begin(4)) { // 4S по умолчанию
+        ESP_LOGE(TAG, "❌ Battery Monitor init failed");
+    }
+#endif
+
+    // ========================================================================
+    // 7. Инициализация GPS  Датчика (ATGM336H)
+    // ========================================================================
+    // В функции setup() (перед Setup complete):
+#if CFG_ENABLE_GPS
+    if (g_ModuleConfig.enableGPS) {
+        ESP_LOGI(TAG, "🛰️ Initializing GPS (ATGM336H)...");
+        if (!gps_handler.begin(9600, NavigationMode::GPS_BDS_COMBINED)) {
+            ESP_LOGE(TAG, "❌ GPS init FAILED!");
+        } else {
+            ESP_LOGI(TAG, "✅ GPS ready");
         }
-    #endif
+    }
+#endif
 
 
         ESP_LOGI(TAG, "🟢 Setup complete. Entering main loop...");
@@ -253,13 +348,24 @@ void loop() {
                      pkt.packet_id, pkt.comUp, pkt.comLeft,
                      lora_get_stats().lastRssi);
 
-            // Маршрутизация команд к сервоприводам (если активны)
-#if CFG_ENABLE_SERVO_MOTORS
-            if (servo_controller.isInitialized()) {
-                // 0-255 → 0-180° внутри processFlightCommands()
+        // 🔑 ИСПРАВЛЕНИЕ: Обновляем глобальные переменные для задачи стабилизации
+        g_comUp = pkt.comUp;
+        g_comLeft = pkt.comLeft;
+
+        // Маршрутизация команд к сервоприводам (если активны)
+        #if CFG_ENABLE_SERVO_MOTORS
+        if (servo_controller.isInitialized()) {
+            // 🔑 ИСКЛЮЧЕНИЕ КОНФЛИКТА: Прямое управление серво только если стабилизация ВЫКЛЮЧЕНА
+            #if CFG_ENABLE_GY91
+                if (!flightStabilizer.isEnabled()) {
+                    servo_controller.processFlightCommands(pkt.comUp, pkt.comLeft);
+                }
+            #else
+                // Если модуль GY91 вообще не скомпилирован, используем прямое управление
                 servo_controller.processFlightCommands(pkt.comUp, pkt.comLeft);
+            #endif
             }
-#endif
+        #endif        
         }
     }
 
@@ -280,6 +386,21 @@ void loop() {
         // Здесь можно добавить emergency actions
     }
 #endif
+
+// В loop() добавьте обновление GY-91:
+#if CFG_ENABLE_GY91
+    if (gy91_handler.isInitialized()) {
+        gy91_handler.update();
+    }
+#endif
+
+
+#if CFG_ENABLE_GPS
+    if (gps_handler.isInitialized()) {
+        gps_handler.update();
+    }
+#endif
+
 
     // 4. Отдача управления планировщику FreeRTOS
     delay(100);
@@ -302,7 +423,7 @@ void loop() {
 static I2CMasterController i2c_manager;  // Глобальный экземпляр контроллера I2C
 
 
-static const char* TAG = "MAIN_TEST";
+// sta_tic const char* TAG = "MAIN_TEST";
 
 void setup() {
     Serial.begin(115200);

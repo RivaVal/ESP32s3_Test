@@ -22,8 +22,12 @@
 // Локальные заголовки проекта
 #include "common/types.h"
 #include "config/pins.h"
-// #include "modules/imu_handler/mpu9250_handler.h"
-#include "modules/imu_handler/MPU9250_Handler.h"  // ← Обратите внимание на регистр!
+        // #include "modules/imu_handler/mpu9250_handler.h"
+        // #include "modules/imu_handler/MPU9250_Handler.h"  // ← Обратите внимание на регистр!
+        // #include "modules/pca9685_servo/pca9685_servo.h"
+
+// 🔑 ЗАМЕНА: Подключаем GY91_Handler вместо MPU9250_Handler
+#include "modules/gy91_handler/GY91_Handler.h" 
 #include "modules/pca9685_servo/pca9685_servo.h"
 
 
@@ -114,7 +118,10 @@ public:
      * @param servoController Указатель на контроллер серво
      * @return true при успехе
      */
-    bool begin(MPU9250Handler* imuHandler, PCA9685ServoController* servoController);
+    // bool begin(MPU9250Handler* imuHandler, PCA9685ServoController* servoController);
+    // 🔑 ЗАМЕНА: Тип указателя изменен на GY91Handler*
+    
+    bool begin(GY91Handler* imuHandler, PCA9685ServoController* servoController);
 
     /**
      * @brief Запуск задачи стабилизации на ядре 1
@@ -131,11 +138,15 @@ public:
     bool update(float comUp, float comLeft);
 
     // Управление
-    void enable();
-    void disable();
+    void enable() { _enabled = true; ESP_LOGI(TAG, "✅ FlightStabilizer ENABLED"); }
+    void disable() { _enabled = false; ESP_LOGW(TAG, "⛔ FlightStabilizer DISABLED"); }
+    bool isEnabled() const { return _enabled; }
+    // Управление
+    // void enable();
+    // void disable();
     void setMode(StabilizationMode mode);
     StabilizationMode getMode() const { return _mode; }
-    bool isEnabled() const { return _enabled; }
+    // bool isEnabled() const { return _enabled; }
 
     // Адаптивность
     void setAdaptivePID(bool enable) { _adaptiveEnabled = enable; }
@@ -159,7 +170,10 @@ public:
 
 private:
     // Указатели на внешние объекты
-    MPU9250Handler* _imuHandler = nullptr;
+    // MPU9250Handler* _imuHandler = nullptr;
+    // PCA9685ServoController* _servoController = nullptr;
+    // 🔑 ЗАМЕНА: Тип указателя изменен на GY91Handler*
+    GY91Handler* _imuHandler = nullptr;
     PCA9685ServoController* _servoController = nullptr;
 
     // Флаги состояния

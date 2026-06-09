@@ -98,8 +98,10 @@ public:
      * @param logical_angle Угол в градусах (-90...+90, где 0 = нейтраль)
      * @return true при успехе
      */
-    bool setLogicalAngle(uint8_t servo_index, int16_t logical_angle);
-
+    // bool setLogicalAngle(uint8_t servo_index, int16_t logical_angle);
+    // Добавьте параметр enable_debug_log
+    bool setLogicalAngle(uint8_t servo_index, int16_t angle, bool enable_debug_log = true); 
+ 
     /**
      * @brief Установка угла (физический диапазон 0°...180°)
      * @param servo_index Индекс сервопривода (0-6)
@@ -168,6 +170,7 @@ public:
      */
     uint8_t getI2CAddress() const { return _i2c_address; }
 
+           
 private:
     static const char* TAG;  ///< Тег для ESP_LOG
 

@@ -5,13 +5,127 @@
  * @brief Реализация ПИД-стабилизации с адаптивными параметрами
  * @version 2.0.0 (ESP32-S3 адаптация)
  */
+// **Файл:** `src/modules/flight_stabilizer/flight_stabilizer.cpp`
+//
 #include "modules/flight_stabilizer/FlightStabilizer.h"
-// #include "modules/flight_stabilizer/FlightStabilizer.h"
+#include <math.h>
+
+const char* FlightStabilizer::TAG = "FLIGHT_STAB";
+
+// 🔑 ГЛОБАЛЬНЫЕ ПЕРЕМЕННЫЕ ДЛЯ ПРИЕМА КОМАНД ИЗ loop()
+// Они обновляются в main.cpp при получении пакета по LoRa
+extern volatile float g_comUp;
+extern volatile float g_comLeft;
+
+// ... (Конструктор, деструктор остаются без изменений) ...
+
+FlightStabilizer::FlightStabilizer() {
+    // Инициализация ПИД по умолчанию (значения требуют тюнинга!)
+    _rollPID = {2.0f, 0.0f, 0.5f, 10.0f, 30.0f, 0.2f};
+    _pitchPID = {2.0f, 0.0f, 0.5f, 10.0f, 30.0f, 0.2f};
+    _yawPID = {1.5f, 0.0f, 0.3f, 10.0f, 45.0f, 0.2f};
+
+    // Сохраняем базовые значения для адаптивности
+    _baseRollPID = _rollPID;
+    _basePitchPID = _pitchPID;
+
+    resetPIDStates();
+
+    ESP_LOGI(TAG, "✅ FlightStabilizer: конструктор завершён");
+    ESP_LOGD(TAG, "   Roll PID: Kp=%.2f Ki=%.2f Kd=%.2f",
+             _rollPID.kp, _rollPID.ki, _rollPID.kd);
+}
+
+FlightStabilizer::~FlightStabilizer() {
+    if (_taskHandle) {
+        vTaskDelete(_taskHandle);
+        _taskHandle = nullptr;
+    }
+    ESP_LOGI(TAG, "🔄 Ресурсы FlightStabilizer освобождены");
+}
+
+
+// 🔑 ЗАМЕНА: Сигнатура метода изменена на GY91Handler*
+bool FlightStabilizer::begin(GY91Handler* imuHandler,
+                             PCA9685ServoController* servoController) {
+    ESP_LOGI(TAG, "=== 🚀 Инициализация FlightStabilizer ===");
+    if (!imuHandler || !servoController) {
+        ESP_LOGE(TAG, "❌ Null pointer в begin(): imu=%p servo=%p", imuHandler, servoController);
+        return false;
+    }
+    _imuHandler = imuHandler;
+    _servoController = servoController;
+
+    if (!_imuHandler->isInitialized()) {
+        ESP_LOGW(TAG, "⚠️ IMU не инициализирован — калибровка в процессе");
+    }
+    
+    _initialized = true;
+    _enabled = false;  // По умолчанию выключено, включим в setup()
+    _lastUpdateMicros = micros();
+    
+    ESP_LOGI(TAG, "✅ FlightStabilizer готов | Режим: %s", modeToString(_mode));
+    return true;
+}
+
+/**
+ * @brief Задача стабилизации на ядре 1 (ESP32-S3)
+ * @details Выполняет update() с фиксированным шагом 250 Гц (4000 мкс)
+ */
+void FlightStabilizer::stabilizationTask(void* parameter) {
+    FlightStabilizer* self = static_cast<FlightStabilizer*>(parameter);
+    
+    while (true) {
+        if (self->_enabled && self->_initialized) {
+            uint32_t now = micros();
+            int32_t elapsed = now - self->_lastUpdateMicros;
+            
+            // 🔑 Фиксированный шаг: 4000 мкс = 250 Гц
+            if (elapsed >= 4000) {  
+                self->_dt = 0.004f;
+                self->_lastUpdateMicros = now;
+                
+                // 🔑 ИСПРАВЛЕНИЕ: Читаем актуальные команды из глобальных volatile переменных
+                self->update(g_comUp, g_comLeft);
+            }
+        }
+        // Отдаём управление планировщику
+        vTaskDelay(1 / portTICK_PERIOD_MS);
+    }
+}
+
+void FlightStabilizer::startStabilizationTask() {
+    if (!_initialized) {
+        ESP_LOGE(TAG, "❌ Нельзя запустить задачу: не инициализирован");
+        return;
+    }
+
+    ESP_LOGI(TAG, "🚀 Создание задачи стабилизации на CORE 1...");
+
+    xTaskCreatePinnedToCore(
+        stabilizationTask,    // Функция задачи
+        "StabilizerTask",     // Имя
+        8192,                 // Стек (8 KB для ESP_LOG внутри)
+        this,                 // Параметр (this)
+        2,                    // Приоритет (выше loop())
+        &_taskHandle,         // Хендл
+        1                     // 🔑 Ядро 1
+    );
+
+    if (_taskHandle) {
+        ESP_LOGI(TAG, "✅ Задача запущена | Heap: %u B", ESP.getFreeHeap());
+    } else {
+        ESP_LOGE(TAG, "❌ Ошибка создания задачи!");
+    }
+}
+
+// ... (остальные методы update, calculatePID, applyRollCorrection и т.д. остаются без изменений) ...
+
+/* 
+#include "modules/flight_stabilizer/FlightStabilizer.h"
 #include <math.h>
 
 // Тег для логирования
-// const char* FlightStabilizer::TAG = "FLIGHT_STAB";
-// const char* TAG = "FLIGHT_STAB";
 const char* FlightStabilizer::TAG = "FLIGHT_STAB";
 
 FlightStabilizer::FlightStabilizer() {
@@ -39,7 +153,10 @@ FlightStabilizer::~FlightStabilizer() {
     ESP_LOGI(TAG, "🔄 Ресурсы FlightStabilizer освобождены");
 }
 
-bool FlightStabilizer::begin(MPU9250Handler* imuHandler,
+// bool FlightStabilizer::begin(MPU9250Handler* imuHandler,
+//                             PCA9685ServoController* servoController) {
+
+bool FlightStabilizer::begin(GY91Handler* imuHandler, 
                             PCA9685ServoController* servoController) {
     ESP_LOGI(TAG, "=== 🚀 Инициализация FlightStabilizer ===");
 
@@ -67,15 +184,17 @@ bool FlightStabilizer::begin(MPU9250Handler* imuHandler,
     return true;
 }
 
-/**
- * @brief Задача стабилизации на ядре 1 (ESP32-S3)
- * @details Выполняет update() с фиксированным шагом 250 Гц
- */
-void FlightStabilizer::stabilizationTask(void* parameter) {
+//   /   *   *
+// * @brief Задача стабилизации на ядре 1 (ESP32-S3)
+//  * @details Выполняет update() с фиксированным шагом 250 Гц
+//  *  /
+
+void Flight_Stabilizer::stabilization_Task(void* parameter) {
     FlightStabilizer* self = static_cast<FlightStabilizer*>(parameter);
 
     // Локальные переменные для команд (обновляются из основного loop)
-    float comUp = 127.0f, comLeft = 127.0f;
+    // float comUp = 127.0f, comLeft = 127.0f;
+    float comUp, comLeft;
 
     while (true) {
         if (self->_enabled && self->_initialized) {
@@ -89,7 +208,8 @@ void FlightStabilizer::stabilizationTask(void* parameter) {
 
                 // 🔧 Получаем актуальные команды (через атомарные переменные или очередь)
                 // В реальном проекте: xQueueReceive() из основного loop
-                self->update(comUp, comLeft);
+                // self->update(comUp, comLeft);
+                self->update(g_comUp, g_comLeft);
             }
         }
 
@@ -122,6 +242,8 @@ void FlightStabilizer::startStabilizationTask() {
         ESP_LOGE(TAG, "❌ Ошибка создания задачи!");
     }
 }
+
+*/
 
 /**
  * @brief Основной метод обновления ПИД-логики

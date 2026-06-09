@@ -33,16 +33,6 @@
 #endif
 
 
-    //----------------------------------------------------------------------------------------
-    //                #ifndef CFG_ENABLE_BATTERY_MONITOR
-    //                #define CFG_ENABLE_BATTERY_MONITOR 0   // 1 = включить модуль, 0 = выключить
-    //                #endif
-
-    //                #ifndef CFG_BATTERY_MONITOR_USE_V2
-    //                #define CFG_BATTERY_MONITOR_USE_V2 1   // 1 = использовать V2, 0 = использовать legacy V1
-    //                #endif
-//----------------------------------------------------------------------------------------
-
 #ifndef CFG_ENABLE_SERVO_MOTORS
 #define CFG_ENABLE_SERVO_MOTORS    1   ///< 1 = Включить код сервоприводов (PCA9685)
 #endif
@@ -55,7 +45,11 @@
 #define CFG_ENABLE_RADIO           1   ///< 1 = Включить код радиомодуля (LoRa SX1278)
 #endif
 
-#ifndef CFG_ENABLE_IMU
+#ifndef CFG_ENABLE_GY91
+#define CFG_ENABLE_GY91            1   ///< 1 = Включить модуль GY-91,  код инерциального модуля
+#endif
+
+#ifndef CFG_ENABLE_IMU                 ///< 0 = Отключить старый MPU9250_Handler
 #define CFG_ENABLE_IMU             1   ///< 1 = Включить код инерциального модуля (MPU9250)
 #endif
 
@@ -68,15 +62,15 @@
 #endif
 
 #ifndef CFG_ENABLE_GPS
-#define CFG_ENABLE_GPS             0   ///< 1 = Включить поддержку GPS (UART)
+#define CFG_ENABLE_GPS             1   ///< 1 = Включить поддержку GPS (UART)
 #endif
 
 #ifndef CFG_ENABLE_I2C_MASTER
 #define CFG_ENABLE_I2C_MASTER      1   ///< 1 = Включить нативный драйвер I2C
 #endif
 
-#ifndef CFG_ENABLE_UART_DRIDGE
-#define CFG_ENABLE_UART_BRIDGE     1   ///< 1 = Включить UART мост to Rpi
+#ifndef CFG_ENABLE_UART_BRIDGE
+#define CFG_ENABLE_UART_BRIDGE     0   ///< 1 = Включить UART мост to Rpi
 #endif
 
 // ============================================================================
@@ -87,6 +81,7 @@ struct ModuleConfig {
     bool enableTractionMotors;
     bool enableRadio;
     bool enableIMU;
+    bool enableGY91;           // ← Новый флаг
     bool enableSD;
     bool enableESP32Cam;
     bool enableGPS;

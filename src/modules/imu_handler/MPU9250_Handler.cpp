@@ -4,7 +4,7 @@
 // 📄 **Файл:** `MPU9250_Handler.cpp` (фрагменты, которые нужно добавить/заменить)
 // ⚙️ **Функция:** `bool MPU9250Handler::begin(I2CMasterController& i2c_manager)`
 // 💻 **Код:**
-// cpp
+// 
 //
 #include "modules/imu_handler/MPU9250_Handler.h"
 // #include "MPU9250_Handler.h"
@@ -29,6 +29,64 @@ MPU9250Handler::MPU9250Handler() : _i2cManager(nullptr), _initialized(false), _g
 bool MPU9250Handler::begin(I2CMasterController& i2c_manager) {
     ESP_LOGI(TAG_MPU, "=== 🚀 ИНИЦИАЛИЗАЦИЯ MPU-9250 (9-AXIS) ===");
     _i2cManager = &i2c_manager;
+    
+    if (!_initMPU6500()) {
+        ESP_LOGE(TAG_MPU, "❌ Ошибка инициализации MPU6500");
+        return false;
+    }
+    
+    // 🔑 НОВАЯ ЛОГИКА: Сначала пробуем прочитать AK8963 напрямую
+    ESP_LOGI(TAG_MPU, "🧲 Поиск магнитометра AK8963...");
+    
+    // Попытка 1: Чтение напрямую (для GY-91 с MPU-6500)
+    uint8_t whoami_mag;
+    if (_i2cManager->readRegister(AK8963_ADDR, AK8963_WIA, &whoami_mag, 1)) {
+        if (whoami_mag == 0x48) {
+            ESP_LOGI(TAG_MPU, "✅ AK8963 найден НАПРЯМУЮ на шине I2C (WHO_AM_I=0x%02X)", whoami_mag);
+            ESP_LOGI(TAG_MPU, "   Это GY-91 с MPU-6500 + AK8963 (Тип B)");
+            _magDirectConnection = true;
+            _magAvailable = true;
+        }
+    }
+    
+    // Попытка 2: Если напрямую не найден, пробуем через bypass (для MPU-9250)
+    if (!_magAvailable) {
+        ESP_LOGI(TAG_MPU, "   AK8963 не найден напрямую, пробуем через I2C Bypass...");
+        if (_enableI2CBypass()) {
+            if (_i2cManager->readRegister(AK8963_ADDR, AK8963_WIA, &whoami_mag, 1)) {
+                if (whoami_mag == 0x48) {
+                    ESP_LOGI(TAG_MPU, "✅ AK8963 найден через I2C Bypass (WHO_AM_I=0x%02X)", whoami_mag);
+                    ESP_LOGI(TAG_MPU, "   Это GY-91 с MPU-9250 (Тип A)");
+                    _magDirectConnection = false;
+                    _magAvailable = true;
+                }
+            }
+        }
+    }
+    
+    // Если магнитометр найден — инициализируем его
+    if (_magAvailable) {
+        if (!_initAK8963()) {
+            ESP_LOGE(TAG_MPU, "❌ Ошибка инициализации магнитометра AK8963");
+            return false;
+        }
+        ESP_LOGI(TAG_MPU, "✅ MPU-9250/6500 + AK8963 инициализирован (9 осей)");
+    } else {
+        ESP_LOGW(TAG_MPU, "⚠️ Магнитометр AK8963 не обнаружен");
+        ESP_LOGW(TAG_MPU, "   Будет использоваться только акселерометр+гироскоп (6 осей)");
+    }
+    
+    _initialized = true;
+    ESP_LOGI(TAG_MPU, "✅ IMU инициализирован. Калибровка гироскопа запущена...");
+    return true;
+}
+
+
+
+/*
+bool MPU9250Handler::begin(I2CMasterController& i2c_manager) {
+    ESP_LOGI(TAG_MPU, "=== 🚀 ИНИЦИАЛИЗАЦИЯ MPU-9250 (9-AXIS) ===");
+    _i2cManager = &i2c_manager;
 
     if (!_initMPU6500()) {
         ESP_LOGE(TAG_MPU, "❌ Ошибка инициализации MPU6500");
@@ -47,6 +105,7 @@ bool MPU9250Handler::begin(I2CMasterController& i2c_manager) {
     ESP_LOGI(TAG_MPU, "✅ MPU-9250 инициализирован. Калибровка гироскопа запущена...");
     return true;
 }
+*/
 
 
 // ⚙️ **Функция:** `bool MPU9250Handler::updateSensors()`
@@ -138,11 +197,88 @@ void MPU9250Handler::_applyComplementaryFilter(float dt) {
 // 🔧 РЕАЛИЗАЦИЯ ПРИВАТНЫХ МЕТОДОВ (заглушки для MVP)
 // Файл: MPU9250_Handler.cpp | Позиция: конец файла
 // ============================================================================
-
 /**
  * @brief Инициализация MPU6500 (акселерометр+гироскоп)
  * @return true при успехе
  */
+bool MPU9250Handler::_initMPU6500() {
+    ESP_LOGI(TAG_MPU, "⚙️  _initMPU6500: сброс питания...");
+    
+    // Сброс через PWR_MGMT_1
+    uint8_t data = 0x80;
+    if (!_i2cManager->writeRegister(MPU6500_ADDR, PWR_MGMT_1, &data, 1)) {
+        ESP_LOGE(TAG_MPU, "❌ Не удалось сбросить MPU6500");
+        return false;
+    }
+    delay(100);
+    
+    // Выход из сна
+    data = 0x01;
+    if (!_i2cManager->writeRegister(MPU6500_ADDR, PWR_MGMT_1, &data, 1)) {
+        ESP_LOGE(TAG_MPU, "❌ Не удалось выйти из сна MPU6500");
+        return false;
+    }
+    delay(10);
+    
+    // Проверка WHO_AM_I
+    uint8_t whoami;
+    if (!_i2cManager->readRegister(MPU6500_ADDR, 0x75, &whoami, 1)) {
+        ESP_LOGE(TAG_MPU, "❌ Не удалось прочитать WHO_AM_I");
+        return false;
+    }
+    
+    // 🔑 ИСПРАВЛЕНИЕ: Правильная интерпретация WHO_AM_I
+    // 0x71 = MPU-9250 (магнитометр внутри, через bypass)
+    // 0x70 = MPU-6500 (магнитометр может быть снаружи, напрямую)
+    // 0x68 = MPU-6050 (магнитометра нет вообще)
+    // 0x73 = MPU-9250 (некоторые версии)
+    
+    if (whoami == 0x71 || whoami == 0x73) {
+        ESP_LOGI(TAG_MPU, "✅ MPU-9250 обнаружен (WHO_AM_I=0x%02X)", whoami);
+        ESP_LOGI(TAG_MPU, "   Магнитометр встроен, будет использоваться I2C Bypass");
+        _magBypassRequired = true;
+    } else if (whoami == 0x70) {
+        ESP_LOGI(TAG_MPU, "✅ MPU-6500 обнаружен (WHO_AM_I=0x70)");
+        ESP_LOGI(TAG_MPU, "   Магнитометр может быть подключен напрямую к I2C");
+        _magBypassRequired = false;
+    } else if (whoami == 0x68) {
+        ESP_LOGW(TAG_MPU, "⚠️ MPU-6050 обнаружен (WHO_AM_I=0x68)");
+        ESP_LOGW(TAG_MPU, "   Магнитометр отсутствует");
+        _magAvailable = false;
+        _magBypassRequired = false;
+    } else {
+        ESP_LOGE(TAG_MPU, "❌ Неизвестный чип: WHO_AM_I=0x%02X", whoami);
+        return false;
+    }
+    
+    // Настройка DLPF
+    data = 0x03;
+    if (!_i2cManager->writeRegister(MPU6500_ADDR, 0x1A, &data, 1)) {
+        ESP_LOGE(TAG_MPU, "❌ Не удалось настроить DLPF");
+        return false;
+    }
+    
+    // Настройка гироскопа: ±250°/s
+    data = 0x00;
+    if (!_i2cManager->writeRegister(MPU6500_ADDR, 0x1B, &data, 1)) {
+        ESP_LOGE(TAG_MPU, "❌ Не удалось настроить гироскоп");
+        return false;
+    }
+    
+    // Настройка акселерометра: ±2g
+    data = 0x00;
+    if (!_i2cManager->writeRegister(MPU6500_ADDR, 0x1C, &data, 1)) {
+        ESP_LOGE(TAG_MPU, "❌ Не удалось настроить акселерометр");
+        return false;
+    }
+    
+    ESP_LOGI(TAG_MPU, "✅ MPU настроен: ±250°/s, ±2g, DLPF=41Hz");
+    return true;
+}
+
+
+
+/*
 bool MPU9250Handler::_initMPU6500() {
     ESP_LOGI(TAG_MPU, "⚙️  _initMPU6500: сброс питания...");
     
@@ -220,6 +356,7 @@ bool MPU9250Handler::_initMPU6500() {
         //                ESP_LOGI(TAG_MPU, "✅ MPU6500 инициализирован (WHO_AM_I=0x%02X)", whoami);
         //                return true;
 }
+*/
 
 /**
  * @brief Включение I2C Bypass для доступа к магнитометру AK8963

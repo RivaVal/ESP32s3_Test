@@ -256,7 +256,7 @@ bool PCA9685ServoController::_writeRegister(uint8_t reg_addr, const uint8_t* dat
 // ============================================================================
 // Публичные методы управления
 // ============================================================================
-
+/*
 bool PCA9685ServoController::setLogicalAngle(uint8_t servo_index, int16_t angle) {
     if (!_initialized || servo_index >= 7) {
         ESP_LOGE(TAG, "❌ setLogicalAngle: невалидные параметры");
@@ -275,6 +275,34 @@ bool PCA9685ServoController::setLogicalAngle(uint8_t servo_index, int16_t angle)
 
     // 🔑 Отладочная печать
     _printPWMDebug(servo_index, safe_angle, pulse_us, ticks);
+
+    ESP_LOGV(TAG, "setLogicalAngle[%u]: %+d° → %u мкс → %u тиков",
+             servo_index, safe_angle, pulse_us, ticks);
+
+    return _setPWM(_servo_channels[servo_index], 0, ticks);
+}
+*/
+
+bool PCA9685ServoController::setLogicalAngle(uint8_t servo_index, int16_t angle, bool enable_debug_log) {
+    if (!_initialized || servo_index >= 7) {
+        ESP_LOGE(TAG, "❌ setLogicalAngle: невалидные параметры");
+        return false;
+    }
+
+    int16_t safe_angle = _validateSafetyAngle(angle);
+    uint16_t pulse_us = _logicalAngleToPulseUs(safe_angle);
+    pulse_us += _servo_trim[servo_index];
+
+    // Ограничение физическими пределами
+    if (pulse_us < _servo_params.min_pulse_us) pulse_us = _servo_params.min_pulse_us;
+    if (pulse_us > _servo_params.max_pulse_us) pulse_us = _servo_params.max_pulse_us;
+
+    uint16_t ticks = _pulseUsToTicks(pulse_us);
+
+    // 🔑 ИЗМЕНЕНО: Выводим отладку только если разрешено
+    if (enable_debug_log) {
+        _printPWMDebug(servo_index, safe_angle, pulse_us, ticks);
+    }
 
     ESP_LOGV(TAG, "setLogicalAngle[%u]: %+d° → %u мкс → %u тиков",
              servo_index, safe_angle, pulse_us, ticks);
@@ -344,6 +372,8 @@ bool PCA9685ServoController::runServoTest() {
              _servo_params.min_pulse_us, _servo_params.max_pulse_us);
     ESP_LOGI(TAG, "   • Циклов теста: %d", SERVO_TEST_CYCLES);
     ESP_LOGI(TAG, "   • Задержка шага: %d мс", SERVO_TEST_STEP_DELAY_MS);
+    
+    delay(100); // 🔑 ДОБАВЛЕНО: Задержка для USB CDC
 
     // Расчётные значения для ключевых углов
     ESP_LOGI(TAG, "📋 РАСЧЁТНЫЕ ЗНАЧЕНИЯ PWM:");
@@ -366,8 +396,30 @@ bool PCA9685ServoController::runServoTest() {
 
             // Все 7 сервоприводов двигаются ОДНОВРЕМЕННО!
             for (uint8_t servo_index = 0; servo_index < 7; servo_index++) {
-                setLogicalAngle(servo_index, target_angle);
-            }
+                //setLogicalAngle(servo_index, target_angle);
+
+                // 🔑 ИЗМЕНЕНО: Передаём только первый серво для детального лога
+                if (servo_index == 0) {
+                    setLogicalAngle(servo_index, target_angle, true);  // Подробный лог
+                } else {
+                    setLogicalAngle(servo_index, target_angle, false); // Без лога
+                }
+             }
+
+                         // 🔑 ИЗМЕНЕНО: Выводим только один раз для шага
+                    //        const char* label;
+                    //        if (target_angle == 0) {
+                    //            label = "НЕЙТРАЛЬ";
+                    //        } else if (target_angle > 0) {
+                    //            label = "МАКС+";
+                   //         } else {
+                    //            label = "МАКС-";
+                    //        }
+                    //        ESP_LOGI(TAG, "   📍 Шаг %u: %+3d° [%s] - все 7 серво",
+                    //                step, target_angle, label);
+                            
+                    //        delay(50); // 🔑 ДОБАВЛЕНО: Задержка для USB CDC
+                    //        delay(SERVO_TEST_STEP_DELAY_MS);
 
             // Отладочный вывод
             const char* label;
@@ -381,11 +433,13 @@ bool PCA9685ServoController::runServoTest() {
             ESP_LOGI(TAG, "   📍 Шаг %u: %+3d° [%s] - все 7 серво",
                      step, target_angle, label);
 
-            delay(SERVO_TEST_STEP_DELAY_MS);
+            delay(50); // 🔑 ДОБАВЛЕНО: Задержка для USB CDC
+             delay(SERVO_TEST_STEP_DELAY_MS);
         }
 
         if (cycle < SERVO_TEST_CYCLES - 1) {
             ESP_LOGI(TAG, "⏳ Пауза между циклами: %d мс", SERVO_TEST_PAUSE_MS);
+            delay(50); // 🔑 ДОБАВЛЕНО: Задержка для USB CDC
             delay(SERVO_TEST_PAUSE_MS);
         }
     }

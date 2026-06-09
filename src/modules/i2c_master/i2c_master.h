@@ -25,7 +25,7 @@
 // Конфигурация I2C
 // ============================================================================
 #define I2C_MASTER_NUM          I2C_NUM_0           ///< Порт I2C (0 или 1)
-#define I2C_MASTER_FREQ_HZ      400000              ///< Частота шины: 400 кГц (Fast Mode)
+#define I2C_MASTER_FREQ_HZ      100000              ///< Частота шины: 400 кГц (Fast Mode)
 #define I2C_MASTER_TX_BUF_LEN   0                   ///< Буфер передачи: отключён
 #define I2C_MASTER_RX_BUF_LEN   0                   ///< Буфер приёма: отключён
 #define I2C_MASTER_TIMEOUT_MS   1000                ///< Таймаут операций (мс)
