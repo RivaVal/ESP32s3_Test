@@ -162,6 +162,12 @@ public:
      */
     void calibrateBarometer();
 
+    /**
+     * @brief  Простой метод-геттер:
+     */
+   bool hasMagnetometer() const { return _hasMagnetometer; }
+
+
 private:
     I2CMasterController* _i2cManager;
     FilterManager _filterManager;
@@ -173,7 +179,7 @@ private:
     bool _hasMagnetometer;  ///< 🔑 НОВОЕ: Флаг наличия магнитометра (true для MPU-9250, false для MPU-6050/6000)
     
     // Калибровка MPU-9250
-    uint16_t _calibrationCount;
+    uint16_t _calibrationCount;         // TelemetryUARTBridge
     float _gyroOffsetX, _gyroOffsetY, _gyroOffsetZ;
     float _magSensitivity[3];
     
@@ -212,6 +218,9 @@ private:
     // ========================================================================
     void _updateIMUData();
     void _updateBaroData();
+
+    uint8_t _bmp280_addr; ///< 🔑 Фактический адрес BMP280 (0x76 или 0x77)
+
 };
 
 #endif // GY91_HANDLER_H

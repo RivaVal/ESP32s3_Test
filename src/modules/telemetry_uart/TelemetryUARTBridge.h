@@ -18,6 +18,7 @@
 #include <HardwareSerial.h>
 
 #include "common/types.h"
+#include "common/CommonTypes.h"
 #include "config/pins.h"
 
 /**

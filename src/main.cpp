@@ -85,11 +85,6 @@ volatile float g_comLeft = 127.0f;   // Нейтраль по умолчанию
 static BatteryMonitor batteryMonitor;  // ← Правильный тип!
 #endif
 
-#if CFG_ENABLE_UART_BRIDGE
-#include "modules/telemetry_uart/TelemetryUARTBridge.h"
-// TelemetryUARTBridge использует статические методы, экземпляр класса не нужен
-#endif
-
 // В начале main.cpp (после других #include):
 #if CFG_ENABLE_GPS
 #include "modules/GPS_module/GPS_Handler.h"
@@ -133,7 +128,30 @@ void setup() {
              ESP.getFreeHeap(), ESP.getPsramSize());
     
     // Уровень отладки (можно менять через platformio.ini)
-    esp_log_level_set("*", ESP_LOG_DEBUG);
+    // esp_log_level_set("*", ESP_LOG_DEBUG);
+
+    // =========================================================================
+    // 🔧 НАСТРОЙКА УРОВНЕЙ ЛОГИРОВАНИЯ ПО МОДУЛЯМ (ЦЕНТРАЛИЗОВАННО)
+    // =========================================================================
+    // Уровни: ESP_LOG_NONE (0), ESP_LOG_ERROR (1), ESP_LOG_WARN (2), 
+    //         ESP_LOG_INFO (3), ESP_LOG_DEBUG (4), ESP_LOG_VERBOSE (5)
+    
+    // 🔴 PCA9685: Отключаем спам (INFO/DEBUG), оставляем только Warnings и Errors
+    esp_log_level_set("PCA9685_SERVO", ESP_LOG_WARN); 
+    // 2. **Если нужно отладить сервоприводы:** Тебе достаточно **одной строки** в `main.cpp` изменить уровень:
+    //  esp_log_level_set("PCA9685_SERVO", ESP_LOG_DEBUG); // Включаем отладку серво
+    
+    // 🟢 Остальные модули: Оставляем нормальный информационный вывод
+    esp_log_level_set("GY91_HANDLER", ESP_LOG_INFO);
+    esp_log_level_set("FLIGHT_STAB", ESP_LOG_INFO);
+    esp_log_level_set("LORA_COMM", ESP_LOG_INFO);
+    esp_log_level_set("BATTERY", ESP_LOG_INFO);
+    esp_log_level_set("GPS_HANDLER", ESP_LOG_INFO);
+    esp_log_level_set("MAIN", ESP_LOG_INFO);
+
+    ESP_LOGI(TAG, "🚀 UAV_ESP32S3_Core Startup...");
+    // ... остальной код setup() ...
+
 
     // ========================================================================
     // 2. Инициализация I2C Master
@@ -189,20 +207,20 @@ void setup() {
     // 4. Инициализация LoRa SX1278
     // ========================================================================
 #if CFG_ENABLE_RADIO
-    if (g_ModuleConfig.enableRadio) {
-        ESP_LOGI(TAG, "📡 Initializing LoRa (SX1278)...");
-        if (!lora_init()) {
-            ESP_LOGE(TAG, "❌ LoRa init FAILED! Critical error.");
-        // 🔧 ВРЕМЕННО: не блокируем setup(), чтобы проверить MPU9250 и FlightStabilizer
-            // Индикация аппаратной ошибки
-        //                    pinMode(LED_BUILTIN, OUTPUT);
-        //                    while (true) {
-        //                        digitalWrite(LED_BUILTIN, HIGH); delay(100);
-        //                        digitalWrite(LED_BUILTIN, LOW);  delay(200);
-        //                    }
-        }
+if (g_ModuleConfig.enableRadio) {
+    ESP_LOGI(TAG, "📡 Initializing LoRa (SX1278)...");
+    if (!lora_init()) {
+        ESP_LOGE(TAG, "❌ LoRa init FAILED! Critical error. Check SPI wiring!");
+        // 🔑 Останавливаем работу, чтобы не было иллюзии работы
+        while(1) { 
+            // delay(100); // Зависаем, чтобы увидеть ошибку
+            digitalWrite(LED_BUILTIN, HIGH); delay(100);
+            digitalWrite(LED_BUILTIN, LOW);  delay(200);
+       }
+    } else {
         ESP_LOGI(TAG, "✅ LoRa ready");
     }
+}
 #endif
 
         //                // ========================================================================
@@ -262,6 +280,9 @@ void setup() {
                 
                 // 🔑 ВКЛЮЧЕНИЕ СТАБИЛИЗАЦИИ
                 flightStabilizer.enable(); // Включаем стабилизацию
+
+                // Установить режим `ROLL_PITCH` по умолчанию
+                flightStabilizer.setMode(StabilizationMode::ROLL_PITCH);
                 
                 // 🔑 Запуск задачи стабилизации на ЯДРЕ 1 (FreeRTOS)
                 flightStabilizer.startStabilizationTask();
@@ -308,9 +329,8 @@ void setup() {
 #endif
 
     // ========================================================================
-    // 7. Инициализация GPS  Датчика (ATGM336H)
+    // 8. Инициализация GPS  Датчика (ATGM336H)
     // ========================================================================
-    // В функции setup() (перед Setup complete):
 #if CFG_ENABLE_GPS
     if (g_ModuleConfig.enableGPS) {
         ESP_LOGI(TAG, "🛰️ Initializing GPS (ATGM336H)...");
@@ -322,6 +342,19 @@ void setup() {
     }
 #endif
 
+    // ========================================================================
+    // 9. Инициализация GPS  Датчика (ATGM336H)
+    // ========================================================================
+    // В функции setup() (перед Setup complete):
+#if CFG_ENABLE_UART_BRIDGE
+    // if (g_ModuleConfig.enableTelemetryUART) {
+    if (g_ModuleConfig.enableUARTBridgeRPI) {
+        ESP_LOGI(TAG, "🔌 Initializing UART2 for RPi...");
+        // 🔑 Используем пины из Config::Pins (RX=6, TX=5)
+        telemetry_uart.begin(115200, SERIAL_8N1, Config::Pins::UART_RPI_RX, Config::Pins::UART_RPI_TX);
+        ESP_LOGI(TAG, "✅ UART2 (RPi) ready on GPIO %d/%d", Config::Pins::UART_RPI_RX, Config::Pins::UART_RPI_TX);
+    }
+#endif
 
         ESP_LOGI(TAG, "🟢 Setup complete. Entering main loop...");
 }
@@ -390,7 +423,7 @@ void loop() {
 // В loop() добавьте обновление GY-91:
 #if CFG_ENABLE_GY91
     if (gy91_handler.isInitialized()) {
-        gy91_handler.update();
+        // gy91_handler.update();   // Опрос IMU каждые 100 мс
     }
 #endif
 
@@ -496,8 +529,17 @@ void loop() {
                  stats.crcErrors, stats.lastRssi);  // 🔑 lastRssi с большой буквы!
         last_print = millis();
     }
-    
-    delay(100);
+
+    // 🔑 ДОБАВИТЬ В КОНЦЕ loop():
+    #if CFG_ENABLE_GPS
+    if (gps_handler.isInitialized()) {
+        gps_handler.update(); // Чтение NMEA-пакетов из UART1
+    }
+    #endif
+
+
+    delay(10);
+
 }
 
 */

@@ -4,15 +4,16 @@
 //  с поддержкой GPS+BDS (двухрежимный). Вот комплексное решение:
 //  🛰️ GPS_Handler.h
 //
-//  🛰️ GPS_Handler.h
 
 #ifndef GPS_HANDLER_H
 #define GPS_HANDLER_H
 
 #include <Arduino.h>
 #include <HardwareSerial.h>
+#include <esp_log.h>
 #include <vector>       // 🔑 ДОБАВИТЬ ЭТУ СТРОКУ для std::vector<Waypoint>
 #include "common/CommonTypes.h"
+#include "config/pins.h"
 
 /**
  * @file GPS_Handler.h

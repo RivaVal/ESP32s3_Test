@@ -71,7 +71,46 @@ bool FlightStabilizer::begin(GY91Handler* imuHandler,
 /**
  * @brief Задача стабилизации на ядре 1 (ESP32-S3)
  * @details Выполняет update() с фиксированным шагом 250 Гц (4000 мкс)
+ * 
+ * Чтобы устранить конфликт, нужно перенести вызов 
+ * gy91_handler.update() из loop() (Ядро 0) в stabilizationTask (Ядро 1). 
+ * Это гарантирует, что чтение IMU и управление сервоприводами происходят 
+ * в одном потоке, последовательно, без конфликтов.
+ *
  */
+void FlightStabilizer::stabilizationTask(void* parameter) {
+    FlightStabilizer* self = static_cast<FlightStabilizer*>(parameter);
+    
+    while (true) {
+        if (self->_enabled && self->_initialized) {
+            uint32_t now = micros();
+            int32_t elapsed = now - self->_lastUpdateMicros;
+            
+            // 🔑 Фиксированный шаг: 4000 мкс = 250 Гц
+            if (elapsed >= 4000) {  
+                self->_dt = 0.004f;
+                self->_lastUpdateMicros = now;
+                
+                // GY91_Handler сможет успешно читать регистры MPU-6000, 
+                // устанавливать флаг _dataReady, и FlightStabilizer 
+                // начнёт получать актуальные углы.
+                // Идеальная синхронизация: IMU опрашивается ровно каждые 4 мс (250 Гц), 
+                // синхронно с расчётом ПИД-регулятора. Это устраняет джиттер и повышает 
+                // стабильность полёта.
+                // 🔑 НОВОЕ: Читаем IMU прямо здесь, на Ядре 1!
+                // Это устраняет конфликт I2C между ядрами.
+                if (self->_imuHandler) {
+                    self->_imuHandler->update();
+                }
+                
+                // Теперь данные IMU гарантированно свежие
+                self->update(g_comUp, g_comLeft);
+            }
+        }
+        vTaskDelay(1 / portTICK_PERIOD_MS);
+    }
+}
+ /*
 void FlightStabilizer::stabilizationTask(void* parameter) {
     FlightStabilizer* self = static_cast<FlightStabilizer*>(parameter);
     
@@ -93,6 +132,7 @@ void FlightStabilizer::stabilizationTask(void* parameter) {
         vTaskDelay(1 / portTICK_PERIOD_MS);
     }
 }
+*/
 
 void FlightStabilizer::startStabilizationTask() {
     if (!_initialized) {
@@ -312,18 +352,30 @@ bool FlightStabilizer::update(float comUp, float comLeft) {
 
     _stats.stabilizations++;
 
-    // 🔹 Периодическая отладка (каждые 50 итераций)
-    #if CONFIG_LOG_DEFAULT_LEVEL >= ESP_LOG_DEBUG
-    if (_stats.stabilizations % 50 == 0)
-        ESP_LOGD(TAG, "STAB| R:%+5.1f°→%+5.1f°| P:%+5.1f°→%+5.1f°| Y:%5.1f°→%5.1f°",
-                 currentRoll, _targetRoll, currentPitch, _targetPitch,
-                 currentYaw, _targetYaw);
-    #endif    
+        //                    // 🔹 Периодическая отладка (каждые 50 итераций)
+        //                    #if CONFIG_LOG_DEFAULT_LEVEL >= ESP_LOG_DEBUG
+        //                    if (_stats.stabilizations % 50 == 0)
+        //                        ESP_LOGD(TAG, "STAB| R:%+5.1f°→%+5.1f°| P:%+5.1f°→%+5.1f°| Y:%5.1f°→%5.1f°",
+        //                                currentRoll, _targetRoll, currentPitch, _targetPitch,
+        //                                currentYaw, _targetYaw);
+        //                    #endif 
+           
         //                if (_stats.stabilizations % 50 == 0 && ESP_LOG_LEVEL >= ESP_LOG_DEBUG) {
         //                    ESP_LOGD(TAG, "STAB| R:%+5.1f°→%+5.1f°| P:%+5.1f°→%+5.1f°| Y:%5.1f°→%5.1f°",
         //                            currentRoll, _targetRoll, currentPitch, _targetPitch,
         //                            currentYaw, _targetYaw);
         //                }
+    
+    // _stats.stabilizations++;
+    
+    // 🔑 НОВАЯ ДИАГНОСТИКА: Вывод текущих углов раз в 1 секунду
+    static uint32_t lastInfoLog = 0;
+    if (millis() - lastInfoLog >= 1000) {
+        ESP_LOGI(TAG, "🛩️ STAB | Roll: %+5.1f° | Pitch: %+5.1f° | Yaw: %+5.1f° | Mode: %s",
+                 currentRoll, currentPitch, currentYaw, modeToString(_mode));
+        lastInfoLog = millis();
+    }
+    
 
     return true;
 }
@@ -477,6 +529,31 @@ void FlightStabilizer::validateAngles(float& roll, float& pitch, float& yaw) {
     // Проверка крена
     if (isnan(roll) || isinf(roll) || abs(roll) > 120.0f) {
         roll = 0.0f;
+        ESP_LOGW(TAG, "⚠️ Аномальный крен: сброшен в 0°");
+    }
+    // Проверка тангажа
+    if (isnan(pitch) || isinf(pitch) || abs(pitch) > 90.0f) {
+        pitch = 0.0f;
+        ESP_LOGW(TAG, "⚠️ Аномальный тангаж: сброшен в 0°");
+    }
+    
+    // 🔑 ИСПРАВЛЕНИЕ: Проверяем наличие магнитометра
+    if (_imuHandler && _imuHandler->hasMagnetometer()) {
+        // Если магнитометр ЕСТЬ — проверяем yaw
+        if (isnan(yaw) || isinf(yaw) || abs(yaw) > 120.0f) {
+            yaw = 0.0f;
+            ESP_LOGW(TAG, "⚠️ Аномальное рыскание: сброшено в 0°");
+        }
+    } else {
+        // 🔑 Если магнитометра НЕТ — просто обнуляем yaw без лога
+        yaw = 0.0f;
+    }
+
+    // ---------------------------
+    /* 
+    // Проверка крена
+    if (isnan(roll) || isinf(roll) || abs(roll) > 120.0f) {
+        roll = 0.0f;
         ESP_LOGW(TAG, "⚠️ Аномальный крен: сброшено в 0°");
     }
 
@@ -491,6 +568,7 @@ void FlightStabilizer::validateAngles(float& roll, float& pitch, float& yaw) {
         yaw = 0.0f;
         ESP_LOGW(TAG, "⚠️ Аномальное рыскание: сброшено в 0°");
     }
+    */
 }
 
 // ============================================================================
@@ -551,6 +629,15 @@ bool FlightStabilizer::isStable() const {
     bool ratesStable = (abs(data.gyro.x) < 0.17f && abs(data.gyro.y) < 0.17f); // ~10°/с в рад/с
 
     return anglesStable && ratesStable;
+}
+
+/**
+ * @brief Установка режима стабилизации
+ * @param mode Новый режим (например, ROLL_PITCH, FULL_3D)
+ */
+void FlightStabilizer::setMode(StabilizationMode mode) {
+    _mode = mode;
+    ESP_LOGI(TAG, "🛩️ Режим стабилизации установлен: %d", (int)mode);
 }
 
 void FlightStabilizer::resetPIDStates() {

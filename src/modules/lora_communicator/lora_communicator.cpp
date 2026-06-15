@@ -13,6 +13,7 @@
 #include "modules/lora_communicator/lora_communicator.h"
 #include "config/pins.h"
 
+/*
 // Таблица CRC8 (полином 0x07)
 static const uint8_t CRC8_TABLE[256] = {
     0x00, 0x07, 0x0E, 0x09, 0x1C, 0x1B, 0x12, 0x15, 0x38, 0x3F, 0x36, 0x31, 0x24, 0x23, 0x2A, 0x2D,
@@ -38,6 +39,7 @@ uint8_t calculateCRC8(const uint8_t* data, size_t length) {
     for (size_t i = 0; i < length; i++) crc = CRC8_TABLE[crc ^ data[i]];
     return crc;
 }
+*/
  
 LoRaReceiver* LoRaReceiver::_instance = nullptr;
 
@@ -136,6 +138,12 @@ void LoRaReceiver::update() {
                 _dataReady = false;
                 _state = LoRaState::PROCESSING;
             }
+            // 🔑 НОВОЕ: Безопасная обработка таймаута ВНЕ прерывания
+            if (_rxTimeoutFlag) {
+                _rxTimeoutFlag = false;
+                ESP_LOGW(LORA_TAG, "⏳ RxTimeout detected, restarting RX safely...");
+                returnToRx(); // Безопасно вызываем startReceive() здесь
+            }
             break;
         case LoRaState::PROCESSING:
             handleRxDone();
@@ -154,7 +162,192 @@ void LoRaReceiver::update() {
     }
 }
 
+/*
+*  Улучшаем `handleRxDone()` (Добавляем диагностику и очистку IRQ):
+*  Замени начало функции `handleRxDone()`, 
+*  чтобы видеть, есть ли вообще сигнал в эфире:
+*
+*  **В SX1278 (и в RadioLib) вызов `getRSSI()` и `getSNR()` ДО чтения буфера FIFO часто приводит 
+*  к сбросу состояния пакета или потере данных в FIFO, особенно если параллельно срабатывают 
+*  другие прерывания!** Кроме того, если в пакете есть ошибка CRC, `readData()` 
+*  вернет ошибку, а не длину.
+*
+*/
 void LoRaReceiver::handleRxDone() {
+    uint8_t buf[sizeof(DataComSet_t)];
+    
+    // 🔑 1. СНАЧАЛА читаем сырые данные из FIFO. 
+    // В RadioLib 7.7.0 readData() возвращает КОД ОШИБКИ (0 = RADIOLIB_ERR_NONE = УСПЕХ), 
+    // а не длину пакета!
+    int16_t state = _radio->readData(buf, sizeof(DataComSet_t));
+    
+    // 🔑 2. ТЕПЕРЬ безопасно запрашиваем метрики сигнала (после чтения FIFO)
+    int16_t rssi = _radio->getRSSI();
+    float snr = _radio->getSNR();
+    
+    // 🔑 3. Очищаем флаги прерываний (для RadioLib 7.7.0 нужен аргумент 0xFF)
+    _radio->clearIrqFlags(0xFF);
+
+    // 🔑 4. Проверяем КОД ОШИБКИ, а не длину!
+    if (state != RADIOLIB_ERR_NONE) {
+        if (state == RADIOLIB_ERR_CRC_MISMATCH) {
+            ESP_LOGW(LORA_TAG, "❌ CRC Error! Packet corrupted (RSSI: %d dBm)", rssi);
+            portENTER_CRITICAL(&_mux);
+            _stats.crcErrors++;
+            portEXIT_CRITICAL(&_mux);
+        } else {
+            ESP_LOGW(LORA_TAG, "⚠️ ReadData failed! Code: %d | RSSI: %d dBm | SNR: %.1f dB", 
+                     state, rssi, snr);
+        }
+        _state = LoRaState::LISTENING;
+        returnToRx();
+        return;
+    }
+
+    // Если дошли сюда — пакет успешно прочитан из FIFO (state == 0)!
+    memcpy(&_rxBuffer, buf, sizeof(DataComSet_t));
+    
+    if (validatePacket(_rxBuffer)) {
+        portENTER_CRITICAL(&_mux);
+        _stats.packetsReceived++;
+        _stats.lastRssi = rssi;
+        _stats.lastPacketTime = millis();
+        portEXIT_CRITICAL(&_mux);
+        
+        ESP_LOGI(LORA_TAG, "✅ Valid Packet | ID:%u | RSSI:%d dBm | SNR:%.1f dB", 
+                 _rxBuffer.packet_id, rssi, snr);
+                 
+        if (_rxBuffer.comSetAll & ACK_REQUEST_FLAG) {
+            ESP_LOGD(LORA_TAG, "📤 ACK requested for ID %u", _rxBuffer.packet_id);
+            sendAck(_rxBuffer.packet_id);
+        }
+    } else {
+        portENTER_CRITICAL(&_mux);
+        _stats.invalidPreamble++;
+        portEXIT_CRITICAL(&_mux);
+        ESP_LOGW(LORA_TAG, "❌ Preamble/Validate error! RSSI:%d dBm", rssi);
+    }
+    
+    _state = LoRaState::LISTENING;
+    returnToRx();
+// }
+
+    /*
+    // 🔑 1. СНАЧАЛА читаем сырые данные из FIFO (это самое важное!)
+    uint8_t buf[sizeof(DataComSet_t)];
+    // Передаем 0 как длину, чтобы RadioLib сам прочитал столько, сколько есть в FIFO,
+    // либо читаем точный размер нашего пакета.
+    int16_t state = _radio->readData(buf, sizeof(DataComSet_t));
+    
+    // 🔑 2. ТЕПЕРЬ безопасно запрашиваем метрики сигнала
+    int16_t rssi = _radio->getRSSI();
+    float snr = _radio->getSNR();
+    
+    // 🔑 3. Очищаем флаги прерываний ПОСЛЕ чтения данных
+    _radio->clearIrqFlags(0xFF);
+
+    // 🔑 4. Проверяем результат чтения (state в RadioLib 7.7.0)
+    // readData возвращает RADIOLIB_ERR_NONE (0) при успехе, или код ошибки.
+    if (state != RADIOLIB_ERR_NONE) {
+        if (state == RADIOLIB_ERR_CRC_MISMATCH) {
+            ESP_LOGW(LORA_TAG, "❌ CRC Error! Packet corrupted (RSSI: %d dBm)", rssi);
+            portENTER_CRITICAL(&_mux);
+            _stats.crcErrors++;
+            portEXIT_CRITICAL(&_mux);
+        } else {
+            ESP_LOGW(LORA_TAG, "⚠️ ReadData failed! Code: %d | RSSI: %d dBm | SNR: %.1f dB", 
+                     state, rssi, snr);
+        }
+        _state = LoRaState::LISTENING;
+        returnToRx();
+        return;
+    }
+
+    // Если дошли сюда — пакет успешно прочитан из FIFO!
+    memcpy(&_rxBuffer, buf, sizeof(DataComSet_t));
+    
+    if (validatePacket(_rxBuffer)) {
+        portENTER_CRITICAL(&_mux);
+        _stats.packetsReceived++;
+        _stats.lastRssi = rssi;
+        _stats.lastPacketTime = millis();
+        portEXIT_CRITICAL(&_mux);
+        
+        ESP_LOGI(LORA_TAG, "✅ Valid Packet | ID:%u | RSSI:%d dBm | SNR:%.1f dB", 
+                 _rxBuffer.packet_id, rssi, snr);
+                 
+        if (_rxBuffer.comSetAll & ACK_REQUEST_FLAG) {
+            ESP_LOGD(LORA_TAG, "📤 ACK requested for ID %u", _rxBuffer.packet_id);
+            sendAck(_rxBuffer.packet_id);
+        }
+    } else {
+        portENTER_CRITICAL(&_mux);
+        _stats.crcErrors++;
+        portEXIT_CRITICAL(&_mux);
+        ESP_LOGW(LORA_TAG, "❌ Preamble/Validate error! RSSI:%d dBm", rssi);
+    }
+    
+    _state = LoRaState::LISTENING;
+    returnToRx();
+    */
+
+    /* 
+    // ИСПРАВЛЕННАЯ ВЕРСИЯ  ДЛЯ ?.?.0  
+    // 🔑 1. Получаем RSSI и SNR ДО чтения данных (иначе они сбросятся)
+    int16_t rssi = _radio->getRSSI();
+    float snr = _radio->getSNR();
+    
+    // 🔑 2. Очищаем IRQ флаги, чтобы DIO0 не "залипал" на мусоре
+    // _radio->clearIrqFlags();
+    
+    // 🔑 2. Очищаем IRQ флаги (RadioLib 7.6.0+ требует параметр!)
+    // _radio->clearIrqFlags(RADIOLIB_SX127X_MASK_IRQ_FLAG_ALL);
+    _radio->clearIrqFlags(0xFF);  // Очистка всех IRQ-флагов SX1278
+
+    // 🔑 3. Читаем данные
+    uint8_t buf[sizeof(DataComSet_t)];
+    int16_t len = _radio->readData(buf, sizeof(buf));
+    
+    if (len <= 0 || static_cast<size_t>(len) < sizeof(DataComSet_t)) {
+        // 🔥 ВАЖНАЯ ДИАГНОСТИКА: Если len=0, но RSSI высокий — значит, пакет битый.
+        // Если RSSI около -110...-120 — значит, это просто шум эфира.
+        ESP_LOGW(LORA_TAG, "⚠️ Read failed/short packet (len=%d, RSSI=%d dBm, SNR=%.1f dB)", 
+                 len, rssi, snr);
+        _state = LoRaState::LISTENING;
+        returnToRx();
+        return;
+    }
+
+    // Если дошли сюда — пакет прочитан успешно
+    memcpy(&_rxBuffer, buf, sizeof(DataComSet_t));
+    
+    if (validatePacket(_rxBuffer)) {
+        portENTER_CRITICAL(&_mux);
+        _stats.packetsReceived++;
+        _stats.lastRssi = rssi; // Сохраняем реальный RSSI
+        _stats.lastPacketTime = millis();
+        portEXIT_CRITICAL(&_mux);
+        
+        ESP_LOGI(LORA_TAG, "✅ Valid Packet | ID:%u | RSSI:%d dBm | SNR:%.1f dB", 
+                 _rxBuffer.packet_id, rssi, snr);
+                 
+        if (_rxBuffer.comSetAll & ACK_REQUEST_FLAG) {
+            ESP_LOGD(LORA_TAG, "📤 ACK requested for ID %u", _rxBuffer.packet_id);
+            sendAck(_rxBuffer.packet_id);
+        }
+    } else {
+        portENTER_CRITICAL(&_mux);
+        _stats.crcErrors++;
+        portEXIT_CRITICAL(&_mux);
+        ESP_LOGW(LORA_TAG, "❌ CRC/Preamble error! RSSI:%d dBm", rssi);
+    }
+    
+    _state = LoRaState::LISTENING;
+    returnToRx();
+    */
+
+    /* -- СТАРАЯ ВЕРСИЯ РЕАЛИЗАЦИИ ФУНКЦИИ --
+
     uint8_t buf[sizeof(DataComSet_t)];
     int16_t len = _radio->readData(buf, sizeof(buf));
     
@@ -189,6 +382,7 @@ void LoRaReceiver::handleRxDone() {
     
     _state = LoRaState::LISTENING;
     returnToRx();
+    */
 }
 
 bool LoRaReceiver::packetAvailable() const {
@@ -280,14 +474,26 @@ void IRAM_ATTR onLoraDio0ISR() {
 void IRAM_ATTR onLoraDio1ISR() {
     // 🔑 Исправлено: явное обращение к статическому члену класса
     if (LoRaReceiver::_instance) {
-        LoRaReceiver::_instance->_radio->startReceive();
+        // 🔑 КАТЕГОРИЧЕСКИ ЗАПРЕЩЕНО вызывать _radio->startReceive() здесь!
+        // Только атомарные операции с флагами.
+        portENTER_CRITICAL_ISR(&LoRaReceiver::_instance->_mux);
+        LoRaReceiver::_instance->_stats.receive_timeouts++;
+        LoRaReceiver::_instance->_rxTimeoutFlag = true; // <--- Просто ставим флаг
+        portEXIT_CRITICAL_ISR(&LoRaReceiver::_instance->_mux);
+    //    ESP_EARLY_LOGV(LORA_TAG, "ISR: DIO1 RxTimeout triggered");
+    }
+
+
+    /* УСТАРЕВШАЯ ОШИБОЧНАЯ ВЕРСИЯ 
+    if (LoRaReceiver::_instance) {
+        LoRaReceiver::_instance->_radio->startReceive(); // ❌ КАТЕГОРИЧЕСКИ НЕЛЬЗЯ!
         
         // Опционально: счётчик таймаутов
         portENTER_CRITICAL_ISR(&LoRaReceiver::_instance->_mux);
         LoRaReceiver::_instance->_stats.receive_timeouts++;
         portEXIT_CRITICAL_ISR(&LoRaReceiver::_instance->_mux);
     }
-
+    */
 
    // if (LoRaReceiver::_instance) {
         // Таймаут приёма: просто перезапускаем приём

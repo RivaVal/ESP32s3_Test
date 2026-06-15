@@ -493,12 +493,12 @@ void PCA9685ServoController::processFlightCommands(uint8_t com_up, uint8_t com_l
 // ============================================================================
 void PCA9685ServoController::_printPWMDebug(uint8_t servo_index, int16_t angle,
                                            uint16_t pulse_us, uint16_t ticks) {
-    ESP_LOGI(TAG, "   🔍 PWM DEBUG: Серво #%u | Угол: %+3d° | Импульс: %u мкс | Тики: %u",
+    ESP_LOGD(TAG, "   🔍 PWM DEBUG: Серво #%u | Угол: %+3d° | Импульс: %u мкс | Тики: %u",
              servo_index, angle, pulse_us, ticks);
 
     // Расчёт фактической длительности
     float actual_us = (ticks * 20000.0f) / 4096.0f;
-    ESP_LOGI(TAG, "   📊 Фактическая длительность: %.1f мкс", actual_us);
+    ESP_LOGD(TAG, "   📊 Фактическая длительность: %.1f мкс", actual_us);
 
     // Проверка расхождения
     float diff = static_cast<float>(pulse_us) - actual_us;

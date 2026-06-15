@@ -61,6 +61,7 @@ private:
     
     DataComSet_t _rxBuffer;
     volatile bool _dataReady = false;
+    volatile bool _rxTimeoutFlag = false; // флаг для таймаута
     volatile uint16_t _ackIdPending = 0;
     
     ReceiverStats _stats;

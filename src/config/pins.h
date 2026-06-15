@@ -43,11 +43,12 @@ namespace Pins {
 
     // --- I2C Шина (Общая для MPU9250, PCA9685) ---
     constexpr uint8_t I2C_SDA    = 8;
-    constexpr uint8_t I2C_SCL    = 9; // Конфликт с RST(9) устранен (RST -> 15)
+    constexpr uint8_t I2C_SCL    = 9; // Конфликт с LORA_RST(9), устранен (LORA_RST -> 15)
 
     // ============================================================================
     // 🔗 UART1 ДЛЯ GPS МОДУЛЯ
     // ============================================================================
+    //
     // Flow Control для GPS НЕ требуется. Используем стандартные свободные пины.
     constexpr uint8_t GPS_RX = 18;  ///< ESP32-S3 RX <- GPS TX
     constexpr uint8_t GPS_TX = 17;  ///< ESP32-S3 TX -> GPS RX
@@ -95,10 +96,6 @@ namespace Pins {
     // GPIO 7 = ADC1_CH6. Поддерживает калибровку (Line Fitting).
     constexpr uint8_t BATTERY_ADC_PIN = 7;
 
-                                // --- GPS (UART) ---
-                                // constexpr uint8_t GPS_RX = 18; // Прием данных от GPS
-                                // constexpr uint8_t GPS_TX = 17; // Передача данных GPS
-
     // --- Периферия ---
     constexpr uint8_t BUZZER_PIN = 255;   // ⛔ Отключен по запросу (освобождает ресурсы)
     // constexpr uint8_t LED_STATUS = 2; // Встроенный LED
@@ -123,9 +120,9 @@ namespace Pins {
             //        constexpr uint8_t UART_RPI_RTS = 3;  ///< Ready To Send (ESP32)
             //        constexpr uint8_t UART_RPI_CTS = 42; ///< Clear To Send (RPi)    
 
-    // Опционально: аппаратный flow control (раскомментировать при высоких нагрузках)
-    // constexpr uint8_t UART_RPI_RTS = 3;  ///< Ready To Send (ESP32)
-    // constexpr uint8_t UART_RPI_CTS = 42; ///< Clear To Send (RPi)
+            // Опционально: аппаратный flow control (раскомментировать при высоких нагрузках)
+            // constexpr uint8_t UART_RPI_RTS = 3;  ///< Ready To Send (ESP32)
+            // constexpr uint8_t UART_RPI_CTS = 42; ///< Clear To Send (RPi)
 
 } //END namespace Pins
 

@@ -2,14 +2,16 @@
 //  🛰️ GPS_Handler.cpp
 //==============================================
 //
-#include "GPS_Handler.h"
 #include <cmath>
 #include <vector>
 #include "esp_log.h"
+#include "config/pins.h"
+#include "GPS_Handler.h"
 
 // Константы для расчетов
 const double EARTH_RADIUS = 6371000.0; // Радиус Земли в метрах
 
+static const char* TAG = "GPS_HANDLER";
 
 GPSHandler::GPSHandler(HardwareSerial* serial) 
     : _gpsSerial(serial), 
@@ -38,12 +40,89 @@ GPSHandler::GPSHandler(HardwareSerial* serial)
 }
 
 bool GPSHandler::begin(int baudRate, NavigationMode mode) {
+    ESP_LOGI(TAG, "🛰️ INITIALIZING ATGM336H GPS/BDS MODULE..."); // <- ЗАМЕНЕНО
+    
+    // Инициализация последовательного порта
+    _gpsSerial->begin(baudRate, SERIAL_8N1, Config::Pins::GPS_RX, Config::Pins::GPS_TX);
+    ESP_LOGI(TAG, "✅ GPS Serial started on RX=%d, TX=%d", Config::Pins::GPS_RX, Config::Pins::GPS_TX);
+    
+    // Ожидание инициализации модуля
+    delay(2000);
+    _navMode = mode;
+    
+    // Настройка модуля
+    if (!initializeGPSModule()) return false;
+
+    // Установка режима навигации
+    if (!setNavigationMode(_navMode)) return false;
+    
+    _initialized = true;
+    ESP_LOGI(TAG, "✅ ATGM336H INITIALIZED | Mode: %s, Baud: %d", 
+             navModeToString(_navMode).c_str(), baudRate);
+    return true;
+}
+
+void GPSHandler::update() {
+    if (!_initialized) return;
+    
+    // ... [Твой существующий код парсинга NMEA без изменений] ...
+
+    if (!_initialized) return;
+    
+    // Чтение данных из последовательного порта
+    while (_gpsSerial->available()) {
+        char c = _gpsSerial->read();
+        
+        if (c == '\n') {
+            // Завершение строки NMEA
+            if (_nmeaBuffer.length() > 6) { // Минимальная длина валидного предложения
+                if (validateChecksum(_nmeaBuffer)) {
+                    parseNMEA(_nmeaBuffer);
+                    _validPackets++;
+                } else {
+                    _parseErrors++;
+                }
+            }
+            _nmeaBuffer = "";
+        } else if (c == '\r') {
+            // Игнорируем carriage return
+            continue;
+        } else if (c == '$') {
+            // Начало нового предложения
+            _nmeaBuffer = "$";
+        } else if (_nmeaBuffer.length() > 0) {
+            // Добавляем символ в буфер
+            _nmeaBuffer += c;
+        }
+    }
+    
+
+    // 🔑 НОВАЯ ДИАГНОСТИКА: Вывод статуса GPS раз в 5 секунд
+    static uint32_t lastGpsLog = 0;
+    if (millis() - lastGpsLog > 5000) {
+        if (_dataValid && _currentData.fix_quality > 0) {
+            ESP_LOGI(TAG, "🛰️ GPS FIX | Sats: %d | Lat: %.6f | Lon: %.6f | Alt: %.1fm",
+                     _currentData.satellites_used, _currentData.latitude, 
+                     _currentData.longitude, _currentData.altitude);
+        } else {
+            ESP_LOGW(TAG, "🛰️ GPS NO FIX | Searching satellites... (Quality: %d)", _currentData.fix_quality);
+        }
+        lastGpsLog = millis();
+    }
+}
+
+
+/*
+bool GPSHandler::begin(int baudRate, NavigationMode mode) {
     Serial.println("🛰️ INITIALIZING ATGM336H GPS/BDS MODULE...");
     
     // Инициализация последовательного порта
-    _gpsSerial->begin(baudRate, SERIAL_8N1, 16, 17); // RX=16, TX=17 согласно новой схеме пинов
-    
-    // Ожидание инициализации модуля
+    // _gpsSerial->begin(baudRate, SERIAL_8N1, 16, 17); // RX=16, TX=17 согласно новой схеме пинов
+    // 🔑 СТАЛО (Правильные пины из Config::Pins):
+    _gpsSerial->begin(baudRate, SERIAL_8N1, Config::Pins::GPS_RX, Config::Pins::GPS_TX);
+    ESP_LOGI(TAG, "✅ GPS Serial started on RX=%d, TX=%d", Config::Pins::GPS_RX, Config::Pins::GPS_TX); 
+
+        // Ожидание инициализации модуля
     delay(2000);
     
     _navMode = mode;
@@ -66,6 +145,7 @@ bool GPSHandler::begin(int baudRate, NavigationMode mode) {
     
     return true;
 }
+*/
 
 bool GPSHandler::initializeGPSModule() {
     Serial.println("⚙️ CONFIGURING GPS MODULE...");
@@ -134,6 +214,8 @@ bool GPSHandler::setNavigationMode(NavigationMode mode) {
     return false;
 }
 
+
+/*
 void GPSHandler::update() {
     if (!_initialized) return;
     
@@ -164,6 +246,7 @@ void GPSHandler::update() {
         }
     }
 }
+*/
 
 bool GPSHandler::validateChecksum(const String& nmea) {
     int starPos = nmea.indexOf('*');
@@ -626,8 +709,10 @@ bool GPSHandler::setBaudRate(int baudRate) {
         // Переинициализация последовательного порта
         _gpsSerial->end();
         delay(100);
-        _gpsSerial->begin(baudRate, SERIAL_8N1, 16, 17);
-        delay(1000);
+        //_gpsSerial->begin(baudRate, SERIAL_8N1, 16, 17);
+        // 🔑 ИСПРАВЛЕНИЕ: Используем пины из глобального конфига
+        // Но в pins.h ты правильно указал: GPS_RX = 18, GPS_TX = 17. Из-за этого GPS не может принимать данные.
+        _gpsSerial->begin(baudRate, SERIAL_8N1, Config::Pins::GPS_RX, Config::Pins::GPS_TX);        delay(1000);
         
         return true;
     }

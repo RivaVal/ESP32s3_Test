@@ -256,7 +256,40 @@ bool GY91Handler::_initAK8963() {
 // Инициализация BMP280
 // ============================================================================
 bool GY91Handler::_initBMP280() {
-    // Проверка Chip ID
+    uint8_t chip_id;
+    
+    // 🔑 1. Пробуем основной адрес (0x76)
+    if (_i2cManager->readRegister(BMP280_ADDR, BMP280_CHIP_ID, &chip_id, 1) && chip_id == 0x58) {
+        _bmp280_addr = BMP280_ADDR;
+    } 
+    // 🔑 2. Пробуем альтернативный адрес (0x77)
+    else if (_i2cManager->readRegister(0x77, BMP280_CHIP_ID, &chip_id, 1) && chip_id == 0x58) {
+        _bmp280_addr = 0x77;
+        ESP_LOGW(TAG, "⚠️ BMP280 найден по альтернативному адресу 0x77");
+    } 
+    else {
+        ESP_LOGE(TAG, "❌ BMP280 не найден по адресам 0x76 и 0x77. Барометр отсутствует.");
+        return false;
+    }
+    
+    ESP_LOGI(TAG, "✅ BMP280 обнаружен (Addr=0x%02X, Chip ID=0x%02X)", _bmp280_addr, chip_id);
+    
+    // Чтение калибровки
+    if (!_readBMP280Calibration()) return false;
+    
+    // Настройка конфигурации (используем _bmp280_addr вместо макроса)
+    uint8_t config = 0x20;  
+    if (!_i2cManager->writeRegister(_bmp280_addr, BMP280_CONFIG, &config, 1)) return false;
+    
+    uint8_t ctrl_meas = 0x27; 
+    if (!_i2cManager->writeRegister(_bmp280_addr, BMP280_CTRL_MEAS, &ctrl_meas, 1)) return false;
+    
+    ESP_LOGI(TAG, "✅ BMP280 настроен: T=x2, P=x16, filter=x16, normal mode");
+    return true;
+}
+    
+    /* Упрощенная версия инициализации
+        // Проверка Chip ID
     uint8_t chip_id;
     if (!_i2cManager->readRegister(BMP280_ADDR, BMP280_CHIP_ID, &chip_id, 1)) {
         ESP_LOGE(TAG, "❌ Не удалось прочитать BMP280 Chip ID");
@@ -292,6 +325,7 @@ bool GY91Handler::_initBMP280() {
     ESP_LOGI(TAG, "✅ BMP280 настроен: T=x2, P=x16, filter=x16, normal mode");
     return true;
 }
+*/
 
 // ============================================================================
 // Чтение калибровки BMP280
@@ -474,18 +508,19 @@ bool GY91Handler::_readMPU9250Data(int16_t accel[3], int16_t gyro[3], int16_t te
 
     // 2. Чтение магнитометра (7 байт: ST1 + 6 байт данных + ST2)
     uint8_t magBuffer[7];
-    if (!_hasMagnetometer) {
-        if (!_i2cManager->readRegister(AK8963_ADDR, AK8963_ST1, magBuffer, 7)) {
-            mag[0] = mag[1] = mag[2] = 0;
-            return true; // Не фатально
-        }
-        //
-        
-        if ((magBuffer[0] & 0x01) == 0 || (magBuffer[0] & 0x08) != 0) {
-            mag[0] = mag[1] = mag[2] = 0;
-            return true;
-        }
-    }//
+    if (!_i2cManager->readRegister(AK8963_ADDR, AK8963_ST1, magBuffer, 7)) {
+        // if (!_hasMagnetometer) {  // "мертвый код" (двойная проверка !_hasMagnetometer), который никогда не выполнится
+            if (!_i2cManager->readRegister(AK8963_ADDR, AK8963_ST1, magBuffer, 7)) {
+                mag[0] = mag[1] = mag[2] = 0;
+                return true; // Не фатально
+            }
+            
+            if ((magBuffer[0] & 0x01) == 0 || (magBuffer[0] & 0x08) != 0) {
+                mag[0] = mag[1] = mag[2] = 0;
+                return true;
+            }
+        // }
+    }
     
     mag[0] = (int16_t)((magBuffer[2] << 8) | magBuffer[1]);
     mag[1] = (int16_t)((magBuffer[4] << 8) | magBuffer[3]);
@@ -516,7 +551,9 @@ void GY91Handler::_updateBaroData() {
 // ============================================================================
 bool GY91Handler::_readBMP280Data() {
     uint8_t buffer[6];
-    if (!_i2cManager->readRegister(BMP280_ADDR, BMP280_PRESS_MSB, buffer, 6)) {
+    // 🔑 ВАЖНО: В методе _readBMP280Data() заменить BMP280_ADDR на _bmp280_addr:
+    // if (!_i2cManager->readRegister(BMP280_ADDR, BMP280_PRESS_MSB, buffer, 6)) {
+    if (!_i2cManager->readRegister(_bmp280_addr, BMP280_PRESS_MSB, buffer, 6)) { // <- ЗАМЕНЕНО
         return false;
     }
     

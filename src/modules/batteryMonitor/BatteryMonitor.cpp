@@ -160,8 +160,12 @@ float BatteryMonitor::_adcToVoltage(int adcRaw) const {
         voltageMV = (adcRaw * 3300) >> 12;
     }
     
+    // Раз делиметр показывает 4.97В при реальных 15.63В, 
+    // то нам нужно умножить его текущий результат на:
+    // `15.63 / 4.97 = 3.145`
     // Переводим в напряжение на пине (В) и учитываем делитель
-    float pinVoltage = voltageMV / 1000.0f;
+    // float pinVoltage = voltageMV / 1000.0f;
+    float pinVoltage = voltageMV / 1000.0f  * 3.145f;
     return pinVoltage * Config::Battery::BATTERY_VOLTAGE_DIVIDER_RATIO;
 }
 

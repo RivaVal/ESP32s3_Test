@@ -27,7 +27,7 @@
 
 // Обратная совместимость: если включен хоть один, включаем общий флаг
 #if (CFG_ENABLE_BATTERY_MONITOR_LEGACY == 1 || CFG_ENABLE_BATTERY_MONITOR_V2 == 1)
-    #define CFG_ENABLE_BATTERY_MONITOR 0
+    #define CFG_ENABLE_BATTERY_MONITOR 1
 #else
     #define CFG_ENABLE_BATTERY_MONITOR 0
 #endif
